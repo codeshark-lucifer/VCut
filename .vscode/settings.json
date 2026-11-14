@@ -1,0 +1,8 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
+  "C_Cpp.default.cppStandard": "c++20",
+  "editor.formatOnSave": true,
+  "files.associations": { "*.hpp": "cpp" }
+}

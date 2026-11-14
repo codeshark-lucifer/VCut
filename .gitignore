@@ -1,0 +1,43 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+Testing/
+
+# Compiled binaries and libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# Runtime & Dear ImGui state
+imgui.ini
+
+# Temporary test outputs and media exports
+output.mp4
+test_roundtrip.vcut
+*.tmp
+*.log
+
+# IDE / Editor directories (keep .vscode/ tracked for tasks/launch/settings)
+.vs/
+.idea/
+.cache/
+.clangd/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
