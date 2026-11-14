@@ -1,0 +1,93 @@
+name: Release VCut (Windows x64)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-nlohmann-json
+
+      - name: Configure & Build Release
+        run: |
+          cmake --preset release
+          cmake --build --preset release
+
+      - name: Run Unit & Pipeline Tests
+        run: |
+          ctest --test-dir build/release --output-on-failure
+
+      - name: Package Portable Windows Release
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("v")) { $tag = "${{ github.event.inputs.tag }}" }
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "v0.1.0" }
+
+          $binDir = "D:\a\_temp\msys64\ucrt64\bin"
+          if (-not (Test-Path $binDir)) { $binDir = "C:\msys64\ucrt64\bin" }
+
+          $distDir = "build/VCut-$tag-win64"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          Copy-Item "build/release/vcut.exe" $distDir -Force
+          Copy-Item "icon.ico" $distDir -Force
+          Copy-Item "README.md" $distDir -Force
+
+          $queue = New-Object System.Collections.Generic.Queue[string]
+          $seen = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+          $queue.Enqueue("$distDir/vcut.exe")
+
+          while ($queue.Count -gt 0) {
+              $current = $queue.Dequeue()
+              $lines = & "$binDir/objdump.exe" -p $current | Select-String "DLL Name:"
+              foreach ($line in $lines) {
+                  $dll = ($line.ToString() -replace ".*DLL Name:\s*", "").Trim()
+                  if ($seen.Add($dll)) {
+                      $src = Join-Path $binDir $dll
+                      if (Test-Path $src) {
+                          Copy-Item $src $distDir -Force
+                          $queue.Enqueue((Join-Path $distDir $dll))
+                      }
+                  }
+              }
+          }
+
+          Compress-Archive -Path "$distDir/*" -DestinationPath "VCut-$tag-win64.zip" -CompressionLevel Optimal
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: "VCut ${{ github.event.inputs.tag || github.ref_name }}"
+          generate_release_notes: true
+          files: VCut-*.zip
