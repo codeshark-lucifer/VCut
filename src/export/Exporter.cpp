@@ -26,10 +26,79 @@ bool drainPackets(AVCodecContext* ctx, AVStream* st, AVFormatContext* fmt, AVPac
     }
 }
 
+bool openVideoEncoderByName(const char* name, AVCodecID fallbackId, const AVFormatContext* fmt,
+                            int W, int H, int fps, bool isHdOr4k, const ExportOptions& opts,
+                            AVCodecContext*& outCtx, const AVCodec*& outCodec,
+                            std::string& outErr) {
+    const AVCodec* codec = name ? avcodec_find_encoder_by_name(name)
+                                : avcodec_find_encoder(fallbackId);
+    if (!codec) {
+        outErr = name ? (std::string("Encoder not found: ") + name) : "H.264 encoder not found";
+        return false;
+    }
+
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    if (!ctx) {
+        outErr = "Cannot allocate video encoder";
+        return false;
+    }
+
+    const std::string_view cname = codec->name ? codec->name : "";
+    const bool isLibx264 = (cname == "libx264");
+    const bool isHw = (cname == "h264_nvenc" || cname == "h264_amf" || cname == "h264_qsv");
+
+    ctx->width = W;
+    ctx->height = H;
+    ctx->time_base = AVRational{1, fps};
+    ctx->framerate = AVRational{fps, 1};
+    ctx->pix_fmt = isHw ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+    ctx->gop_size = fps * 2;
+    ctx->thread_count = 0;  // auto-detect threads for 4K/HD encoding
+    ctx->color_range = AVCOL_RANGE_MPEG;
+    ctx->colorspace = isHdOr4k ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+    ctx->color_primaries = isHdOr4k ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M;
+    ctx->color_trc = isHdOr4k ? AVCOL_TRC_BT709 : AVCOL_TRC_SMPTE170M;
+    if (fmt->oformat->flags & AVFMT_GLOBALHEADER) ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    const int crf = std::clamp(opts.crf, 0, 51);
+    const double qualScale = crf <= 18 ? 1.5 : (crf >= 25 ? 0.65 : 1.0);
+    const double pxScale = (static_cast<double>(W) * H) / (1920.0 * 1080.0);
+    const int64_t targetBitrate = static_cast<int64_t>(
+        std::clamp(12'000'000.0 * pxScale * (fps / 30.0) * qualScale, 1'500'000.0, 90'000'000.0));
+
+    if (isLibx264) {
+        const std::string crfStr = std::to_string(crf);
+        const char* presetStr = opts.preset.empty() ? "veryfast" : opts.preset.c_str();
+        av_opt_set(ctx->priv_data, "preset", presetStr, 0);
+        av_opt_set(ctx->priv_data, "crf", crfStr.c_str(), 0);
+    } else if (cname == "h264_nvenc") {
+        ctx->bit_rate = targetBitrate;
+        av_opt_set(ctx->priv_data, "preset", "p4", 0);
+        av_opt_set(ctx->priv_data, "cq", std::to_string(crf).c_str(), 0);
+    } else if (cname == "h264_qsv") {
+        ctx->bit_rate = targetBitrate;
+        av_opt_set_int(ctx->priv_data, "global_quality", crf, 0);
+    } else {
+        ctx->bit_rate = targetBitrate;
+    }
+
+    const int r = avcodec_open2(ctx, codec, nullptr);
+    if (r < 0) {
+        outErr = avErrorString(r);
+        avcodec_free_context(&ctx);
+        return false;
+    }
+
+    outCtx = ctx;
+    outCodec = codec;
+    return true;
+}
+
 }  // namespace
 
 bool exportProject(const Project& project, const ExportOptions& opts, std::string* error,
-                   std::atomic<float>* progress, const std::atomic<bool>* cancel) {
+                   std::atomic<float>* progress, const std::atomic<bool>* cancel,
+                   std::string* usedEncoder) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -38,10 +107,14 @@ bool exportProject(const Project& project, const ExportOptions& opts, std::strin
     const Time totalDur = project.duration();
     if (totalDur <= 0) return fail("Timeline is empty");
 
-    const int W = ((opts.width > 0 ? opts.width : project.settings.width) + 1) & ~1;
-    const int H = ((opts.height > 0 ? opts.height : project.settings.height) + 1) & ~1;
-    const int fps = opts.fps > 0 ? opts.fps : project.settings.fps;
-    const int rate = opts.sampleRate > 0 ? opts.sampleRate : project.settings.sampleRate;
+    const int rawW = opts.width > 0 ? opts.width : project.settings.width;
+    const int rawH = opts.height > 0 ? opts.height : project.settings.height;
+    const int W = (std::max(2, rawW) + 1) & ~1;
+    const int H = (std::max(2, rawH) + 1) & ~1;
+    const int fps = std::clamp(opts.fps > 0 ? opts.fps : project.settings.fps, 1, 240);
+    const int rate =
+        std::max(8000, opts.sampleRate > 0 ? opts.sampleRate : project.settings.sampleRate);
+    const bool isHdOr4k = (W >= 1280 || H >= 720);
 
     AVFormatContext* fmt = nullptr;
     int r = avformat_alloc_output_context2(&fmt, nullptr, "mp4", opts.outputPath.c_str());
@@ -76,26 +149,42 @@ bool exportProject(const Project& project, const ExportOptions& opts, std::strin
         }
     } cleanup{fmt, vctx, actx, vframe, aframe, pkt, sws};
 
-    // Video stream (H.264)
-    const AVCodec* vcodec = avcodec_find_encoder_by_name("libx264");
-    if (!vcodec) vcodec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    if (!vcodec) return fail("H.264 encoder not found");
+    // Video stream (H.264 via requested backend or safe CPU libx264 fallback)
+    std::vector<const char*> candidates;
+    switch (opts.encoder) {
+        case EncoderBackend::Nvenc:
+            candidates = {"h264_nvenc"};
+            break;
+        case EncoderBackend::Amf:
+            candidates = {"h264_amf"};
+            break;
+        case EncoderBackend::Qsv:
+            candidates = {"h264_qsv"};
+            break;
+        case EncoderBackend::Auto:
+            candidates = {"h264_nvenc", "h264_amf", "h264_qsv", "libx264", nullptr};
+            break;
+        case EncoderBackend::CpuX264:
+        default:
+            candidates = {"libx264", nullptr};
+            break;
+    }
+
+    const AVCodec* vcodec = nullptr;
+    std::string lastEncErr;
+    for (const char* cand : candidates) {
+        if (openVideoEncoderByName(cand, AV_CODEC_ID_H264, fmt, W, H, fps, isHdOr4k, opts, vctx,
+                                   vcodec, lastEncErr)) {
+            break;
+        }
+    }
+    if (!vctx || !vcodec) {
+        return fail("Cannot open video encoder: " + lastEncErr);
+    }
+    if (usedEncoder && vcodec->name) *usedEncoder = vcodec->name;
 
     AVStream* vst = avformat_new_stream(fmt, nullptr);
-    vctx = avcodec_alloc_context3(vcodec);
-    vctx->width = W;
-    vctx->height = H;
-    vctx->time_base = AVRational{1, fps};
-    vctx->framerate = AVRational{fps, 1};
-    vctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    vctx->gop_size = fps * 2;
-    if (fmt->oformat->flags & AVFMT_GLOBALHEADER) vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    if (vcodec->name && std::string_view(vcodec->name) == "libx264") {
-        av_opt_set(vctx->priv_data, "preset", "veryfast", 0);
-        av_opt_set(vctx->priv_data, "crf", "21", 0);
-    }
-    if ((r = avcodec_open2(vctx, vcodec, nullptr)) < 0)
-        return fail("Cannot open video encoder: " + avErrorString(r));
+    if (!vst) return fail("Cannot create video stream");
     avcodec_parameters_from_context(vst->codecpar, vctx);
     vst->time_base = vctx->time_base;
 
@@ -105,6 +194,7 @@ bool exportProject(const Project& project, const ExportOptions& opts, std::strin
 
     AVStream* ast = avformat_new_stream(fmt, nullptr);
     actx = avcodec_alloc_context3(acodec);
+    if (!ast || !actx) return fail("Cannot allocate audio encoder");
     actx->sample_fmt = AV_SAMPLE_FMT_FLTP;
     actx->sample_rate = rate;
     av_channel_layout_default(&actx->ch_layout, 2);
@@ -120,26 +210,44 @@ bool exportProject(const Project& project, const ExportOptions& opts, std::strin
         if ((r = avio_open(&fmt->pb, opts.outputPath.c_str(), AVIO_FLAG_WRITE)) < 0)
             return fail("Cannot open output file: " + avErrorString(r));
     }
-    if ((r = avformat_write_header(fmt, nullptr)) < 0)
-        return fail("Cannot write MP4 header: " + avErrorString(r));
+    {
+        AVDictionary* muxOpts = nullptr;
+        av_dict_set(&muxOpts, "movflags", "+faststart", 0);
+        r = avformat_write_header(fmt, &muxOpts);
+        av_dict_free(&muxOpts);
+        if (r < 0) return fail("Cannot write MP4 header: " + avErrorString(r));
+    }
 
     vframe = av_frame_alloc();
+    if (!vframe) return fail("Cannot allocate video frame");
     vframe->format = vctx->pix_fmt;
     vframe->width = W;
     vframe->height = H;
-    av_frame_get_buffer(vframe, 32);
+    vframe->color_range = vctx->color_range;
+    vframe->colorspace = vctx->colorspace;
+    vframe->color_primaries = vctx->color_primaries;
+    vframe->color_trc = vctx->color_trc;
+    if ((r = av_frame_get_buffer(vframe, 32)) < 0)
+        return fail("Cannot allocate video frame buffer: " + avErrorString(r));
 
     const int audioFrameSize = actx->frame_size > 0 ? actx->frame_size : 1024;
     aframe = av_frame_alloc();
+    if (!aframe) return fail("Cannot allocate audio frame");
     aframe->format = actx->sample_fmt;
     av_channel_layout_copy(&aframe->ch_layout, &actx->ch_layout);
     aframe->sample_rate = rate;
     aframe->nb_samples = audioFrameSize;
-    av_frame_get_buffer(aframe, 0);
+    if ((r = av_frame_get_buffer(aframe, 0)) < 0)
+        return fail("Cannot allocate audio frame buffer: " + avErrorString(r));
 
-    sws = sws_getContext(W, H, AV_PIX_FMT_RGBA, W, H, AV_PIX_FMT_YUV420P, SWS_BILINEAR, nullptr,
+    sws = sws_getContext(W, H, AV_PIX_FMT_RGBA, W, H, vctx->pix_fmt, SWS_BILINEAR, nullptr,
                          nullptr, nullptr);
     if (!sws) return fail("Cannot create RGBA->YUV converter");
+    if (isHdOr4k) {
+        const int* invTable = sws_getCoefficients(SWS_CS_DEFAULT);
+        const int* table = sws_getCoefficients(SWS_CS_ITU709);
+        sws_setColorspaceDetails(sws, invTable, 1, table, 0, 0, 1 << 16, 1 << 16);
+    }
 
     Compositor compositor;
     AudioMixer mixer;
@@ -185,15 +293,17 @@ bool exportProject(const Project& project, const ExportOptions& opts, std::strin
         }
 
         if (progress) {
-            progress->store(static_cast<float>(vPts) / static_cast<float>(totalVideoFrames));
+            progress->store(
+                0.98f * (static_cast<float>(vPts) / static_cast<float>(totalVideoFrames)));
         }
     }
 
     avcodec_send_frame(vctx, nullptr);
-    drainPackets(vctx, vst, fmt, pkt);
+    if (!drainPackets(vctx, vst, fmt, pkt)) return fail("Failed flushing video encoder");
     avcodec_send_frame(actx, nullptr);
-    drainPackets(actx, ast, fmt, pkt);
-    av_write_trailer(fmt);
+    if (!drainPackets(actx, ast, fmt, pkt)) return fail("Failed flushing audio encoder");
+    if ((r = av_write_trailer(fmt)) < 0)
+        return fail("Cannot finalize MP4: " + avErrorString(r));
 
     if (progress) progress->store(1.0f);
     return true;
@@ -214,14 +324,17 @@ void ExportJob::start(Project project, ExportOptions opts) {
     {
         std::lock_guard<std::mutex> lock(errMutex_);
         error_.clear();
+        usedEncoder_.clear();
     }
     running_.store(true);
     worker_ = std::thread([this, p = std::move(project), o = std::move(opts)]() {
         std::string err;
-        const bool ok = exportProject(p, o, &err, &progress_, &cancel_);
+        std::string enc;
+        const bool ok = exportProject(p, o, &err, &progress_, &cancel_, &enc);
         {
             std::lock_guard<std::mutex> lock(errMutex_);
             error_ = std::move(err);
+            usedEncoder_ = std::move(enc);
         }
         ok_.store(ok);
         done_.store(true);
@@ -238,6 +351,11 @@ void ExportJob::wait() {
 std::string ExportJob::error() const {
     std::lock_guard<std::mutex> lock(errMutex_);
     return error_;
+}
+
+std::string ExportJob::usedEncoder() const {
+    std::lock_guard<std::mutex> lock(errMutex_);
+    return usedEncoder_;
 }
 
 }  // namespace vcut

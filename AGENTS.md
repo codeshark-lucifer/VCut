@@ -8,7 +8,8 @@ This file documents the architecture, build commands, conventions, and design in
 
 **VCut** is a lightweight, CapCut-inspired desktop video editor written in **C++20** using:
 - **Dear ImGui (docking branch)** + **SDL3** + **OpenGL 3.3 Core** for the UI, windowing, native file dialogs, and audio output stream.
-- **FFmpeg** (`libavformat`, `libavcodec`, `libswscale`, `libswresample`, `libavutil`) for probing, decoding, scaling, resampling, and MP4 (`H.264 + AAC`) encoding.
+- **FFmpeg** (`libavformat`, `libavcodec`, `libswscale`, `libswresample`, `libavutil`) for probing, decoding, scaling, resampling, and MP4 (`H.264 + AAC` via CPU `libx264` or GPU `h264_nvenc`/`h264_amf`/`h264_qsv`) encoding.
+- **FreeType2** (`freetype2`) for headless UTF-8 text overlay and subtitle rasterization.
 - **nlohmann/json** for `.vcut` project file serialization.
 
 ---
@@ -59,7 +60,8 @@ VCut/
 │   │   ├── MediaProbe.hpp/.cpp # Inspects media files into MediaAsset structs
 │   │   ├── VideoDecoder.hpp/.cpp # Frame-accurate video & still-image decoder with smart seeking
 │   │   ├── AudioDecoder.hpp/.cpp # Stereo float resampler/decoder via libswresample
-│   │   ├── FrameBlit.hpp/.cpp  # Aspect-ratio letterbox scaling, alpha blend, thumbnail extraction
+│   │   ├── FrameBlit.hpp/.cpp  # Aspect-ratio letterbox scaling, transforms, color/chroma key, thumbnails
+│   │   ├── TextRenderer.hpp/.cpp # FreeType2 headless UTF-8 text & subtitle pill rasterizer
 │   │   └── Waveform.hpp/.cpp   # Audio peak extraction & caching for timeline clip waveforms
 │   ├── engine/
 │   │   ├── Compositor.hpp/.cpp # Evaluates visible video tracks at Time t into an RGBA buffer

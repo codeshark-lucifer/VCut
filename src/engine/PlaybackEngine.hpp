@@ -34,6 +34,11 @@ public:
     void seek(Time t);
     void stepFrames(const Project& project, int deltaFrames);
 
+    // J / K / L shuttle controls
+    void shuttleBackward();
+    void shuttleForward();
+    float playbackSpeed() const { return playbackSpeed_.load(); }
+
     bool isPlaying() const { return playing_.load(); }
     Time playhead() const { return playhead_.load(); }
 
@@ -54,6 +59,10 @@ public:
     bool updateFrame(const Project& project, std::uint64_t version, int previewW, int previewH,
                      double dtSeconds);
 
+    FitRect clipScreenBox(const Project& project, const Clip& clip, int width, int height) {
+        return compositor_.clipScreenBox(project, clip, width, height);
+    }
+
     const std::vector<std::uint8_t>& frameRgba() const { return rgba_; }
     int frameWidth() const { return frameW_; }
     int frameHeight() const { return frameH_; }
@@ -67,6 +76,7 @@ private:
     int sampleRate_ = 48000;
 
     std::atomic<bool> playing_{false};
+    std::atomic<float> playbackSpeed_{1.0f};
     std::atomic<Time> playhead_{0};
     std::atomic<Time> audioCursor_{0};
     std::atomic<float> masterVolume_{1.0f};

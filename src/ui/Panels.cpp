@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <iterator>
+#include <utility>
 
 #include "core/TimelineOps.hpp"
 #include "media/FrameBlit.hpp"
@@ -23,6 +27,8 @@ const char* mediaBadge(MediaType t) {
             return "AUDIO";
         case MediaType::Image:
             return "IMAGE";
+        case MediaType::Text:
+            return "TEXT";
     }
     return "MEDIA";
 }
@@ -83,7 +89,7 @@ void drawClipWaveform(ImDrawList* dl, const Clip& c, const AudioWaveform& wf, fl
     for (float px = startX; px < endX; px += 3.0f) {
         const double frac = std::clamp(static_cast<double>(px - x0) / clipW, 0.0, 1.0);
         const Time rel = static_cast<Time>(frac * static_cast<double>(clipDur));
-        const Time srcT = c.in + rel;
+        const Time srcT = c.in + c.timelineToSourceOffset(rel);
         float env = c.muted ? 0.0f : c.volume;
         if (c.fadeIn > 0 && rel < c.fadeIn) {
             env *= static_cast<float>(rel) / static_cast<float>(c.fadeIn);
@@ -97,23 +103,71 @@ void drawClipWaveform(ImDrawList* dl, const Clip& c, const AudioWaveform& wf, fl
     }
 }
 
+template <class Fn>
+void applyControlEdit(Editor& editor, bool& inspectorGesture, bool changed, Fn&& fn) {
+    if (ImGui::IsItemActivated() && !editor.inGesture()) {
+        editor.beginGesture();
+        inspectorGesture = true;
+    }
+    if (changed) {
+        if (inspectorGesture && editor.inGesture())
+            editor.gestureApply(std::forward<Fn>(fn));
+        else
+            editor.edit(std::forward<Fn>(fn));
+    }
+    if (ImGui::IsItemDeactivated() && inspectorGesture) {
+        if (editor.inGesture()) editor.endGesture();
+        inspectorGesture = false;
+    }
+}
+
+void sameLineWrap(float nextEstimatedWidth) {
+    const float avail = ImGui::GetWindowContentRegionMax().x;
+    const float lastRight = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    if (lastRight + spacing + nextEstimatedWidth <= avail) {
+        ImGui::SameLine();
+    }
+}
+
 }  // namespace
 
-void drawMediaBinPanel(Editor& editor, ThumbnailCache& thumbs, const UiCallbacks& cb) {
+void drawMediaBinPanel(Editor& editor, PlaybackEngine& playback, ThumbnailCache& thumbs,
+                       const UiCallbacks& cb) {
     ImGui::Begin("Media Bin");
 
-    if (ui::PrimaryButton("+ Import Media", ImVec2(146, 30))) {
+    if (ui::PrimaryButton("+ Import Media", ImVec2(126, 30))) {
         if (cb.onImportMedia) cb.onImportMedia();
     }
     ImGui::SameLine();
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5.0f);
-    ImGui::TextDisabled("(%zu items)", editor.project().assets.size());
+    if (ui::Button("+ Text", ImVec2(64, 30))) {
+        const Time t = playback.playhead();
+        int textClipId = 0;
+        editor.edit([&](Project& p) {
+            textClipId = ops::addTextClip(p, 0, t);
+            return textClipId != 0;
+        });
+        if (textClipId != 0) {
+            editor.selectedClip = textClipId;
+            editor.selectedAsset = 0;
+        }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add a Text overlay clip at the playhead");
+    ImGui::SameLine();
+    if (ui::Button(".SRT", ImVec2(48, 30))) {
+        if (cb.onImportSubtitles) cb.onImportSubtitles();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Import .srt subtitle file onto a track");
 
+    ImGui::TextDisabled("%zu media item%s", editor.project().assets.size(),
+                        editor.project().assets.size() == 1 ? "" : "s");
     ImGui::Separator();
 
     if (editor.project().assets.empty()) {
         ImGui::Spacing();
-        ImGui::TextDisabled("Drop video, audio, or image files here,\nor click '+ Import Media'.");
+        ImGui::TextDisabled(
+            "Drop video, audio, image, or .srt files here,\n"
+            "or click '+ Import Media' / '+ Text'.");
         ImGui::End();
         return;
     }
@@ -139,7 +193,6 @@ void drawMediaBinPanel(Editor& editor, ThumbnailCache& thumbs, const UiCallbacks
         const float delX = plusX + btnSize + btnGap;
         const float btnY = cardMin.y + (rowH - btnSize) * 0.5f;
 
-        // Invisible button covering the left/middle portion of the card for selection & drag-source
         if (ImGui::InvisibleButton("##asset", ImVec2(std::max(60.0f, cardW - buttonsBlockW - 6.0f), rowH))) {
             editor.selectedAsset = a.id;
             editor.selectedClip = 0;
@@ -207,7 +260,6 @@ void drawMediaBinPanel(Editor& editor, ThumbnailCache& thumbs, const UiCallbacks
                     displayMeta.c_str());
         dl->PopClipRect();
 
-        // Action buttons: positioned explicitly on the same horizontal row
         ImGui::SetCursorScreenPos(ImVec2(plusX, btnY));
         if (ui::CircleActionButton("##add", false, btnSize)) appendAssetId = a.id;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add to timeline");
@@ -238,7 +290,8 @@ void drawMediaBinPanel(Editor& editor, ThumbnailCache& thumbs, const UiCallbacks
     ImGui::End();
 }
 
-void drawPreviewPanel(Editor& editor, PlaybackEngine& playback, GlTexture& previewTex) {
+void drawPreviewPanel(Editor& editor, PlaybackEngine& playback, TimelineViewState& view,
+                      GlTexture& previewTex) {
     ImGui::Begin("Preview");
 
     const Project& proj = editor.project();
@@ -261,11 +314,122 @@ void drawPreviewPanel(Editor& editor, PlaybackEngine& playback, GlTexture& previ
     }
     dl->AddRect(pMin, pMax, IM_COL32(55, 60, 72, 255));
 
+    // Interactive on-canvas selection overlay & drag/scale handles for the selected clip
+    const Time curPlayhead = playback.playhead();
+    const Track* selTrack = nullptr;
+    const Clip* selClip = ops::findClip(proj, editor.selectedClip, &selTrack);
+    const bool showOverlay = selClip && selTrack && selTrack->kind == TrackKind::Video &&
+                             !selTrack->hidden && selClip->contains(curPlayhead) && fit.w > 8 &&
+                             fit.h > 8;
+
+    const ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 mouse = io.MousePos;
+    const bool previewHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+    if (showOverlay) {
+        const FitRect cBox =
+            playback.clipScreenBox(proj, *selClip, proj.settings.width, proj.settings.height);
+        if (cBox.w > 0 && cBox.h > 0) {
+            const float sx = static_cast<float>(fit.w) / static_cast<float>(proj.settings.width);
+            const float sy = static_cast<float>(fit.h) / static_cast<float>(proj.settings.height);
+            const ImVec2 bMin(pMin.x + cBox.x * sx, pMin.y + cBox.y * sy);
+            const ImVec2 bMax(pMin.x + (cBox.x + cBox.w) * sx, pMin.y + (cBox.y + cBox.h) * sy);
+
+            dl->PushClipRect(pMin, pMax, true);
+            dl->AddRect(bMin, bMax, IM_COL32(0, 215, 230, 235), 0.0f, 0, 1.5f);
+
+            const float hr = 5.5f;
+            const ImVec2 corners[4] = {
+                bMin,
+                ImVec2(bMax.x, bMin.y),
+                ImVec2(bMin.x, bMax.y),
+                bMax,
+            };
+            bool onCorner = false;
+            for (const ImVec2& c : corners) {
+                dl->AddRectFilled(ImVec2(c.x - hr, c.y - hr), ImVec2(c.x + hr, c.y + hr),
+                                  IM_COL32(255, 255, 255, 255), 2.0f);
+                dl->AddRect(ImVec2(c.x - hr, c.y - hr), ImVec2(c.x + hr, c.y + hr),
+                            IM_COL32(0, 185, 200, 255), 2.0f);
+                if (std::fabs(mouse.x - c.x) <= hr + 4.0f &&
+                    std::fabs(mouse.y - c.y) <= hr + 4.0f) {
+                    onCorner = true;
+                }
+            }
+            dl->PopClipRect();
+
+            const bool insideBox = (mouse.x >= bMin.x && mouse.x <= bMax.x && mouse.y >= bMin.y &&
+                                    mouse.y <= bMax.y);
+            if (previewHovered && view.previewDragKind == TimelineViewState::PreviewDragKind::None) {
+                if (onCorner)
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
+                else if (insideBox)
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+            }
+
+            if (previewHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                (onCorner || insideBox) &&
+                mouse.x >= pMin.x && mouse.x <= pMax.x && mouse.y >= pMin.y && mouse.y <= pMax.y) {
+                view.previewDragKind = onCorner ? TimelineViewState::PreviewDragKind::Scale
+                                                : TimelineViewState::PreviewDragKind::Move;
+                view.previewDragClipId = selClip->id;
+                view.previewStartMouseX = mouse.x;
+                view.previewStartMouseY = mouse.y;
+                view.previewOrigPosX = selClip->posX;
+                view.previewOrigPosY = selClip->posY;
+                view.previewOrigScale = selClip->scale;
+                editor.beginGesture();
+            }
+        }
+    }
+
+    if (view.previewDragKind != TimelineViewState::PreviewDragKind::None) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const int cid = view.previewDragClipId;
+            if (view.previewDragKind == TimelineViewState::PreviewDragKind::Move) {
+                float nx = view.previewOrigPosX + (mouse.x - view.previewStartMouseX) / fit.w;
+                float ny = view.previewOrigPosY + (mouse.y - view.previewStartMouseY) / fit.h;
+                if (std::fabs(nx) < 0.015f) nx = 0.0f;
+                if (std::fabs(ny) < 0.015f) ny = 0.0f;
+                nx = std::clamp(nx, -1.5f, 1.5f);
+                ny = std::clamp(ny, -1.5f, 1.5f);
+                editor.gestureApply([cid, nx, ny](Project& p) {
+                    if (auto r = ops::findClip(p, cid)) {
+                        r.clip->posX = nx;
+                        r.clip->posY = ny;
+                        return true;
+                    }
+                    return false;
+                });
+            } else {
+                const float cx = pMin.x + (0.5f + view.previewOrigPosX) * fit.w;
+                const float cy = pMin.y + (0.5f + view.previewOrigPosY) * fit.h;
+                const float d0 = std::hypot(view.previewStartMouseX - cx, view.previewStartMouseY - cy);
+                const float d1 = std::hypot(mouse.x - cx, mouse.y - cy);
+                if (d0 > 8.0f) {
+                    const float newScale =
+                        std::clamp(view.previewOrigScale * (d1 / d0), 0.1f, 4.0f);
+                    editor.gestureApply([cid, newScale](Project& p) {
+                        if (auto r = ops::findClip(p, cid)) {
+                            r.clip->scale = newScale;
+                            return true;
+                        }
+                        return false;
+                    });
+                }
+            }
+        } else {
+            if (editor.inGesture()) editor.endGesture();
+            view.previewDragKind = TimelineViewState::PreviewDragKind::None;
+            view.previewDragClipId = 0;
+        }
+    }
+
     ImGui::Dummy(ImVec2(canvasW, canvasH));
 
     // Scrubber bar
     const Time dur = std::max(proj.duration(), Time{1});
-    float sec = static_cast<float>(toSeconds(playback.playhead()));
+    float sec = static_cast<float>(toSeconds(curPlayhead));
     const float maxSec = static_cast<float>(toSeconds(dur));
     if (ui::ScrubberBar("##scrub", &sec, maxSec)) {
         playback.pause();
@@ -288,7 +452,7 @@ void drawPreviewPanel(Editor& editor, PlaybackEngine& playback, GlTexture& previ
             true)) {
         playback.togglePlay();
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play / Pause (Space)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play / Pause (Space)  |  Shuttle: J / K / L");
     ImGui::SameLine();
     ImGui::SetCursorPosY(transportY + 3.0f);
     if (ui::TransportButton("##next", ui::TransportIcon::StepFwd)) playback.stepFrames(proj, 1);
@@ -308,8 +472,14 @@ void drawPreviewPanel(Editor& editor, PlaybackEngine& playback, GlTexture& previ
 
     ImGui::SameLine();
     ImGui::SetCursorPosY(transportY + 7.0f);
-    ImGui::Text(" %s / %s", formatTime(playback.playhead()).c_str(),
-                formatTime(proj.duration()).c_str());
+    const float pSpeed = playback.playbackSpeed();
+    if (playback.isPlaying() && std::fabs(pSpeed - 1.0f) > 0.05f) {
+        ImGui::Text(" %s / %s (%.0fx)", formatTime(curPlayhead).c_str(),
+                    formatTime(proj.duration()).c_str(), pSpeed);
+    } else {
+        ImGui::Text(" %s / %s", formatTime(curPlayhead).c_str(),
+                    formatTime(proj.duration()).c_str());
+    }
 
     ImGui::SameLine();
     ImGui::SetCursorPosY(transportY + 3.0f);
@@ -335,29 +505,363 @@ void drawPreviewPanel(Editor& editor, PlaybackEngine& playback, GlTexture& previ
     ImGui::End();
 }
 
-void drawInspectorPanel(Editor& editor, PlaybackEngine& playback) {
+void drawInspectorPanel(Editor& editor, PlaybackEngine& playback, TimelineViewState& view) {
     ImGui::Begin("Inspector");
+
+    static bool inspectorGesture = false;
+    static int gestureClipId = 0;
 
     const Project& proj = editor.project();
     const Track* clipTrack = nullptr;
     const Clip* clip = ops::findClip(proj, editor.selectedClip, &clipTrack);
 
+    if (inspectorGesture && (!clip || clip->id != gestureClipId)) {
+        if (editor.inGesture()) editor.endGesture();
+        inspectorGesture = false;
+        gestureClipId = 0;
+    }
+
     if (clip) {
-        const MediaAsset* asset = proj.findAsset(clip->assetId);
+        const MediaAsset* asset = clip->isText ? nullptr : proj.findAsset(clip->assetId);
         const int clipId = clip->id;
+        gestureClipId = clipId;
+        const bool isVisual =
+            clip->isText || (clipTrack && clipTrack->kind == TrackKind::Video);
 
         ImGui::SeparatorText("Selected Clip");
-        ImGui::Text("Source: %s", asset ? asset->name.c_str() : "(unknown)");
-        ImGui::Text("Track:  %s", clipTrack ? clipTrack->name.c_str() : "");
-        ImGui::Text("Start:  %s", formatTime(clip->start).c_str());
-        ImGui::Text("End:    %s", formatTime(clip->end()).c_str());
-        ImGui::Text("Length: %s", formatTime(clip->duration()).c_str());
-        ImGui::Text("In/Out: %s - %s", formatTime(clip->in).c_str(), formatTime(clip->out).c_str());
+        ImGui::Text("Source: %s",
+                    clip->isText ? "Text Overlay" : (asset ? asset->name.c_str() : "(unknown)"));
+        ImGui::Text("Track:  %s  |  Length: %s", clipTrack ? clipTrack->name.c_str() : "",
+                    formatTime(clip->duration()).c_str());
+        ImGui::Text("Range:  %s - %s", formatTime(clip->start).c_str(),
+                    formatTime(clip->end()).c_str());
 
-        if (asset && asset->hasAudio) {
-            ImGui::Spacing();
-            ImGui::SeparatorText("Clip Audio");
+        if (clip->isText && ImGui::CollapsingHeader("Text Overlay", ImGuiTreeNodeFlags_DefaultOpen)) {
+            char buf[512];
+            std::snprintf(buf, sizeof buf, "%s", clip->text.content.c_str());
+            const bool edited = ImGui::InputTextMultiline("##txtcontent", buf, sizeof buf,
+                                                          ImVec2(-1.0f, 58.0f));
+            applyControlEdit(editor, inspectorGesture, edited,
+                             [clipId, s = std::string(buf)](Project& p) {
+                                 if (auto r = ops::findClip(p, clipId)) {
+                                     if (r.clip->text.content == s) return false;
+                                     r.clip->text.content = s;
+                                     return true;
+                                 }
+                                 return false;
+                             });
 
+            float fontSizeF = static_cast<float>(clip->text.fontSize);
+            const bool fChanged =
+                ui::SliderFloat("Font Size", &fontSizeF, 16.0f, 180.0f, "%.0f px");
+            applyControlEdit(editor, inspectorGesture, fChanged, [clipId, fontSizeF](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    const int ns = std::clamp(static_cast<int>(std::lround(fontSizeF)), 12, 240);
+                    if (r.clip->text.fontSize == ns) return false;
+                    r.clip->text.fontSize = ns;
+                    return true;
+                }
+                return false;
+            });
+
+            float col[3] = {clip->text.color[0], clip->text.color[1], clip->text.color[2]};
+            if (ImGui::ColorEdit3("Text Color", col)) {
+                editor.edit([clipId, col](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        for (int i = 0; i < 3; ++i) r.clip->text.color[i] = col[i];
+                        return true;
+                    }
+                    return false;
+                });
+            }
+
+            float bgCol[3] = {clip->text.bgColor[0], clip->text.bgColor[1],
+                              clip->text.bgColor[2]};
+            if (ImGui::ColorEdit3("Box Color", bgCol)) {
+                editor.edit([clipId, bgCol](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        for (int i = 0; i < 3; ++i) r.clip->text.bgColor[i] = bgCol[i];
+                        return true;
+                    }
+                    return false;
+                });
+            }
+
+            float bgOp = clip->text.bgOpacity * 100.0f;
+            const bool bgChanged = ui::SliderFloat("Box Alpha", &bgOp, 0.0f, 100.0f, "%.0f%%");
+            applyControlEdit(editor, inspectorGesture, bgChanged, [clipId, bgOp](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->text.bgOpacity = std::clamp(bgOp / 100.0f, 0.0f, 1.0f);
+                    return true;
+                }
+                return false;
+            });
+
+            bool sh = clip->text.shadow;
+            if (ui::ToggleSwitch("Drop Shadow", &sh)) {
+                editor.edit([clipId, sh](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->text.shadow = sh;
+                        return true;
+                    }
+                    return false;
+                });
+            }
+        }
+
+        if (isVisual && ImGui::CollapsingHeader("Transform & Opacity", ImGuiTreeNodeFlags_DefaultOpen)) {
+            float scPct = clip->scale * 100.0f;
+            const bool scChanged = ui::SliderFloat("Scale", &scPct, 10.0f, 400.0f, "%.0f%%");
+            applyControlEdit(editor, inspectorGesture, scChanged, [clipId, scPct](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->scale = std::clamp(scPct / 100.0f, 0.1f, 4.0f);
+                    return true;
+                }
+                return false;
+            });
+
+            float pxPct = clip->posX * 100.0f;
+            const bool pxChanged = ui::SliderFloat("Pos X", &pxPct, -100.0f, 100.0f, "%.0f%%");
+            applyControlEdit(editor, inspectorGesture, pxChanged, [clipId, pxPct](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->posX = std::clamp(pxPct / 100.0f, -1.5f, 1.5f);
+                    return true;
+                }
+                return false;
+            });
+
+            float pyPct = clip->posY * 100.0f;
+            const bool pyChanged = ui::SliderFloat("Pos Y", &pyPct, -100.0f, 100.0f, "%.0f%%");
+            applyControlEdit(editor, inspectorGesture, pyChanged, [clipId, pyPct](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->posY = std::clamp(pyPct / 100.0f, -1.5f, 1.5f);
+                    return true;
+                }
+                return false;
+            });
+
+            float opPct = clip->opacity * 100.0f;
+            const bool opChanged = ui::SliderFloat("Opacity", &opPct, 0.0f, 100.0f, "%.0f%%");
+            applyControlEdit(editor, inspectorGesture, opChanged, [clipId, opPct](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->opacity = std::clamp(opPct / 100.0f, 0.0f, 1.0f);
+                    return true;
+                }
+                return false;
+            });
+
+            const float maxFadeSec =
+                std::max(0.1f, static_cast<float>(toSeconds(clip->duration()) * 0.5));
+            float vFadeIn = static_cast<float>(toSeconds(clip->videoFadeIn));
+            const bool vfiChanged = ui::SliderFloat("Vid Fade In", &vFadeIn, 0.0f, maxFadeSec, "%.2f s");
+            applyControlEdit(editor, inspectorGesture, vfiChanged, [clipId, vFadeIn](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->videoFadeIn =
+                        std::clamp<Time>(fromSeconds(vFadeIn), 0, r.clip->duration());
+                    return true;
+                }
+                return false;
+            });
+
+            float vFadeOut = static_cast<float>(toSeconds(clip->videoFadeOut));
+            const bool vfoChanged =
+                ui::SliderFloat("Vid Fade Out", &vFadeOut, 0.0f, maxFadeSec, "%.2f s");
+            applyControlEdit(editor, inspectorGesture, vfoChanged, [clipId, vFadeOut](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->videoFadeOut =
+                        std::clamp<Time>(fromSeconds(vFadeOut), 0, r.clip->duration());
+                    return true;
+                }
+                return false;
+            });
+
+            if (ui::Button("Reset Transform", ImVec2(ImGui::GetContentRegionAvail().x, 26))) {
+                editor.edit([clipId](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->scale = 1.0f;
+                        r.clip->posX = 0.0f;
+                        r.clip->posY = 0.0f;
+                        r.clip->opacity = 1.0f;
+                        return true;
+                    }
+                    return false;
+                });
+            }
+        }
+
+        // Playback speed (for media clips: video & audio)
+        if (!clip->isText && (!asset || asset->type != MediaType::Image) &&
+            ImGui::CollapsingHeader("Speed", ImGuiTreeNodeFlags_DefaultOpen)) {
+            float spd = clip->speed;
+            const bool spdChanged = ui::SliderFloat("Speed", &spd, 0.25f, 4.0f, "%.2fx");
+            applyControlEdit(editor, inspectorGesture, spdChanged, [clipId, spd](Project& p) {
+                return ops::setClipSpeed(p, clipId, spd);
+            });
+
+            static constexpr float kSpeedPresets[] = {0.5f, 1.0f, 1.5f, 2.0f};
+            for (int si = 0; si < 4; ++si) {
+                if (si > 0) ImGui::SameLine(0.0f, 4.0f);
+                char sl[16];
+                std::snprintf(sl, sizeof sl, "%.1fx##sp", kSpeedPresets[si]);
+                const bool active = std::fabs(clip->speed - kSpeedPresets[si]) < 0.02f;
+                if (ui::Button(sl, ImVec2(48, 24), active)) {
+                    const float target = kSpeedPresets[si];
+                    editor.edit([clipId, target](Project& p) {
+                        return ops::setClipSpeed(p, clipId, target);
+                    });
+                }
+            }
+        }
+
+        if (isVisual && !clip->isText && ImGui::CollapsingHeader("Color & Filters")) {
+            float br = clip->brightness;
+            const bool brChanged = ui::SliderFloat("Brightness", &br, -1.0f, 1.0f, "%.2f");
+            applyControlEdit(editor, inspectorGesture, brChanged, [clipId, br](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->brightness = std::clamp(br, -1.0f, 1.0f);
+                    return true;
+                }
+                return false;
+            });
+
+            float ct = clip->contrast;
+            const bool ctChanged = ui::SliderFloat("Contrast", &ct, 0.0f, 2.0f, "%.2f");
+            applyControlEdit(editor, inspectorGesture, ctChanged, [clipId, ct](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->contrast = std::clamp(ct, 0.0f, 2.0f);
+                    return true;
+                }
+                return false;
+            });
+
+            float sat = clip->saturation;
+            const bool satChanged = ui::SliderFloat("Saturation", &sat, 0.0f, 2.0f, "%.2f");
+            applyControlEdit(editor, inspectorGesture, satChanged, [clipId, sat](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->saturation = std::clamp(sat, 0.0f, 2.0f);
+                    return true;
+                }
+                return false;
+            });
+
+            float vig = clip->vignette * 100.0f;
+            const bool vigChanged = ui::SliderFloat("Vignette", &vig, 0.0f, 100.0f, "%.0f%%");
+            applyControlEdit(editor, inspectorGesture, vigChanged, [clipId, vig](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->vignette = std::clamp(vig / 100.0f, 0.0f, 1.0f);
+                    return true;
+                }
+                return false;
+            });
+
+            bool gs = clip->grayscale;
+            if (ui::ToggleSwitch("Black & White", &gs)) {
+                editor.edit([clipId, gs](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->grayscale = gs;
+                        return true;
+                    }
+                    return false;
+                });
+            }
+
+            if (ui::Button("Reset Color", ImVec2(ImGui::GetContentRegionAvail().x, 26))) {
+                editor.edit([clipId](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->brightness = 0.0f;
+                        r.clip->contrast = 1.0f;
+                        r.clip->saturation = 1.0f;
+                        r.clip->vignette = 0.0f;
+                        r.clip->grayscale = false;
+                        return true;
+                    }
+                    return false;
+                });
+            }
+        }
+
+        if (isVisual && !clip->isText && ImGui::CollapsingHeader("Chroma Key (Green Screen)")) {
+            bool ck = clip->chromaKey;
+            if (ui::ToggleSwitch("Enable Chroma Key", &ck)) {
+                editor.edit([clipId, ck](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->chromaKey = ck;
+                        return true;
+                    }
+                    return false;
+                });
+            }
+            if (ck) {
+                float ccol[3] = {clip->chromaColor[0], clip->chromaColor[1], clip->chromaColor[2]};
+                if (ImGui::ColorEdit3("Key Color", ccol)) {
+                    editor.edit([clipId, ccol](Project& p) {
+                        if (auto r = ops::findClip(p, clipId)) {
+                            for (int i = 0; i < 3; ++i) r.clip->chromaColor[i] = ccol[i];
+                            return true;
+                        }
+                        return false;
+                    });
+                }
+
+                float sim = clip->chromaSimilarity;
+                const bool simChanged = ui::SliderFloat("Similarity", &sim, 0.02f, 0.65f, "%.2f");
+                applyControlEdit(editor, inspectorGesture, simChanged, [clipId, sim](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->chromaSimilarity = std::clamp(sim, 0.02f, 0.65f);
+                        return true;
+                    }
+                    return false;
+                });
+
+                float bld = clip->chromaBlend;
+                const bool bldChanged = ui::SliderFloat("Edge Blend", &bld, 0.0f, 0.35f, "%.2f");
+                applyControlEdit(editor, inspectorGesture, bldChanged, [clipId, bld](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->chromaBlend = std::clamp(bld, 0.0f, 0.35f);
+                        return true;
+                    }
+                    return false;
+                });
+            }
+        }
+
+        if (isVisual && ImGui::CollapsingHeader("Transition In")) {
+            static constexpr const char* kTransLabels[] = {
+                "None", "Cross Dissolve", "Dip to Black", "Wipe Left", "Wipe Right",
+            };
+            int trIdx = static_cast<int>(clip->transitionIn);
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##transin", &trIdx, kTransLabels, 5)) {
+                editor.edit([clipId, trIdx](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->transitionIn = static_cast<TransitionKind>(std::clamp(trIdx, 0, 4));
+                        if (r.clip->transitionIn != TransitionKind::None &&
+                            r.clip->transitionInDur <= 0) {
+                            r.clip->transitionInDur = std::min<Time>(kSecond / 2, r.clip->duration());
+                        }
+                        return true;
+                    }
+                    return false;
+                });
+            }
+            if (clip->transitionIn != TransitionKind::None) {
+                const float maxTr =
+                    std::max(0.1f, static_cast<float>(toSeconds(clip->duration())));
+                float trSec = static_cast<float>(toSeconds(clip->transitionInDur));
+                const bool trChanged = ui::SliderFloat("Duration##tr", &trSec, 0.05f, maxTr, "%.2f s");
+                applyControlEdit(editor, inspectorGesture, trChanged, [clipId, trSec](Project& p) {
+                    if (auto r = ops::findClip(p, clipId)) {
+                        r.clip->transitionInDur =
+                            std::clamp<Time>(fromSeconds(trSec), 0, r.clip->duration());
+                        return true;
+                    }
+                    return false;
+                });
+            }
+        }
+
+        if (asset && asset->hasAudio &&
+            ImGui::CollapsingHeader("Clip Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
             bool clipMuted = clip->muted;
             if (ui::ToggleSwitch("Mute Clip Audio", &clipMuted)) {
                 editor.edit([clipId, clipMuted](Project& p) {
@@ -370,42 +874,38 @@ void drawInspectorPanel(Editor& editor, PlaybackEngine& playback) {
             }
 
             float volPct = clip->volume * 100.0f;
-            if (ui::SliderFloat("Volume", &volPct, 0.0f, 200.0f, "%.0f%%")) {
-                const float newVol = std::clamp(volPct / 100.0f, 0.0f, 2.0f);
-                editor.edit([clipId, newVol](Project& p) {
-                    if (auto r = ops::findClip(p, clipId)) {
-                        r.clip->volume = newVol;
-                        return true;
-                    }
-                    return false;
-                });
-            }
+            const bool vChanged = ui::SliderFloat("Volume", &volPct, 0.0f, 200.0f, "%.0f%%");
+            applyControlEdit(editor, inspectorGesture, vChanged, [clipId, volPct](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->volume = std::clamp(volPct / 100.0f, 0.0f, 2.0f);
+                    return true;
+                }
+                return false;
+            });
 
             const float maxFadeSec =
                 std::max(0.1f, static_cast<float>(toSeconds(clip->duration()) * 0.5));
             float fadeInSec = static_cast<float>(toSeconds(clip->fadeIn));
-            if (ui::SliderFloat("Fade In", &fadeInSec, 0.0f, maxFadeSec, "%.2f s")) {
-                const Time fi = fromSeconds(fadeInSec);
-                editor.edit([clipId, fi](Project& p) {
-                    if (auto r = ops::findClip(p, clipId)) {
-                        r.clip->fadeIn = std::clamp<Time>(fi, 0, r.clip->duration());
-                        return true;
-                    }
-                    return false;
-                });
-            }
+            const bool fiChanged =
+                ui::SliderFloat("Fade In", &fadeInSec, 0.0f, maxFadeSec, "%.2f s");
+            applyControlEdit(editor, inspectorGesture, fiChanged, [clipId, fadeInSec](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->fadeIn = std::clamp<Time>(fromSeconds(fadeInSec), 0, r.clip->duration());
+                    return true;
+                }
+                return false;
+            });
 
             float fadeOutSec = static_cast<float>(toSeconds(clip->fadeOut));
-            if (ui::SliderFloat("Fade Out", &fadeOutSec, 0.0f, maxFadeSec, "%.2f s")) {
-                const Time fo = fromSeconds(fadeOutSec);
-                editor.edit([clipId, fo](Project& p) {
-                    if (auto r = ops::findClip(p, clipId)) {
-                        r.clip->fadeOut = std::clamp<Time>(fo, 0, r.clip->duration());
-                        return true;
-                    }
-                    return false;
-                });
-            }
+            const bool foChanged =
+                ui::SliderFloat("Fade Out", &fadeOutSec, 0.0f, maxFadeSec, "%.2f s");
+            applyControlEdit(editor, inspectorGesture, foChanged, [clipId, fadeOutSec](Project& p) {
+                if (auto r = ops::findClip(p, clipId)) {
+                    r.clip->fadeOut = std::clamp<Time>(fromSeconds(fadeOutSec), 0, r.clip->duration());
+                    return true;
+                }
+                return false;
+            });
 
             if (clipTrack && clipTrack->kind == TrackKind::Video) {
                 ImGui::Spacing();
@@ -423,15 +923,33 @@ void drawInspectorPanel(Editor& editor, PlaybackEngine& playback) {
 
         ImGui::Spacing();
         ImGui::SeparatorText("Clip Actions");
-        const float actionW = ImGui::GetContentRegionAvail().x;
-        if (ui::Button("Split at Playhead (S)", ImVec2(actionW, 28))) {
+        const float halfW = (ImGui::GetContentRegionAvail().x - 6.0f) * 0.5f;
+        if (ui::Button("Duplicate (Ctrl+D)", ImVec2(halfW, 28))) {
+            int dupId = 0;
+            editor.edit([&](Project& p) {
+                dupId = ops::duplicateClip(p, clipId);
+                return dupId != 0;
+            });
+            if (dupId != 0) editor.selectedClip = dupId;
+        }
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ui::Button("Split (S)", ImVec2(halfW, 28))) {
             editor.edit(
                 [&](Project& p) { return ops::splitClip(p, clipId, playback.playhead()) != 0; });
         }
-        if (ui::Button("Delete Clip (Del)", ImVec2(actionW, 28))) {
+        if (ui::Button("Delete (Del)", ImVec2(halfW, 28))) {
             editor.edit([&](Project& p) { return ops::deleteClip(p, clipId); });
             editor.selectedClip = 0;
         }
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ui::Button("Ripple Del", ImVec2(halfW, 28))) {
+            editor.edit([&](Project& p) { return ops::rippleDeleteClip(p, clipId); });
+            editor.selectedClip = 0;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Delete clip and shift later clips on track left (Shift+Del)");
+        }
+        (void)view;
     } else if (const MediaAsset* asset = proj.findAsset(editor.selectedAsset)) {
         ImGui::SeparatorText("Media Asset");
         ImGui::Text("Name: %s", asset->name.c_str());
@@ -460,8 +978,72 @@ void drawInspectorPanel(Editor& editor, PlaybackEngine& playback) {
 
     ImGui::Spacing();
     ImGui::SeparatorText("Project Settings");
-    ImGui::Text("Canvas: %d x %d", proj.settings.width, proj.settings.height);
-    ImGui::Text("Frame rate: %d fps", proj.settings.fps);
+    {
+        struct CanvasPreset {
+            const char* label;
+            int w;
+            int h;
+        };
+        static constexpr CanvasPreset kCanvasPresets[] = {
+            {"4K UHD (3840x2160)", 3840, 2160},
+            {"1440p QHD (2560x1440)", 2560, 1440},
+            {"1080p FHD (1920x1080)", 1920, 1080},
+            {"720p HD (1280x720)", 1280, 720},
+            {"4K Vertical (2160x3840)", 2160, 3840},
+            {"1080p Vertical (1080x1920)", 1080, 1920},
+        };
+        int curCanvasIdx = -1;
+        for (int i = 0; i < static_cast<int>(std::size(kCanvasPresets)); ++i) {
+            if (proj.settings.width == kCanvasPresets[i].w &&
+                proj.settings.height == kCanvasPresets[i].h) {
+                curCanvasIdx = i;
+                break;
+            }
+        }
+        char customLabel[48];
+        std::snprintf(customLabel, sizeof customLabel, "Custom (%dx%d)", proj.settings.width,
+                      proj.settings.height);
+        const char* previewLabel =
+            curCanvasIdx >= 0 ? kCanvasPresets[curCanvasIdx].label : customLabel;
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##canvas_preset", previewLabel)) {
+            for (int i = 0; i < static_cast<int>(std::size(kCanvasPresets)); ++i) {
+                const bool selected = (i == curCanvasIdx);
+                if (ImGui::Selectable(kCanvasPresets[i].label, selected)) {
+                    const int newW = kCanvasPresets[i].w;
+                    const int newH = kCanvasPresets[i].h;
+                    editor.edit([newW, newH](Project& p) {
+                        if (p.settings.width == newW && p.settings.height == newH) return false;
+                        p.settings.width = newW;
+                        p.settings.height = newH;
+                        return true;
+                    });
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        static constexpr int kProjectFps[] = {24, 30, 60};
+        static constexpr const char* kProjectFpsLabels[] = {"24 fps", "30 fps", "60 fps"};
+        int fpsIdx = 1;
+        for (int i = 0; i < static_cast<int>(std::size(kProjectFps)); ++i) {
+            if (proj.settings.fps == kProjectFps[i]) {
+                fpsIdx = i;
+                break;
+            }
+        }
+        ImGui::SetNextItemWidth(110.0f);
+        if (ImGui::Combo("Frame rate##proj", &fpsIdx, kProjectFpsLabels,
+                         static_cast<int>(std::size(kProjectFpsLabels)))) {
+            const int newFps = kProjectFps[fpsIdx];
+            editor.edit([newFps](Project& p) {
+                if (p.settings.fps == newFps) return false;
+                p.settings.fps = newFps;
+                return true;
+            });
+        }
+    }
     ImGui::Text("Audio: %d Hz stereo", proj.settings.sampleRate);
     ImGui::Text("Timeline duration: %s", formatTime(proj.duration()).c_str());
 
@@ -474,40 +1056,64 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
 
     const Project& proj = editor.project();
 
-    // Toolbar row: Edit tools + Pan/Select mode + Navigation + Zoom
-    if (ui::Button(view.panMode ? "Tool: Hand (Pan)" : "Tool: Select", ImVec2(0, 28),
-                   view.panMode)) {
-        view.panMode = !view.panMode;
+    // Tools: Select (V), Razor (C), Hand (H)
+    if (ui::Button("Select (V)", ImVec2(0, 28), view.tool == TimelineTool::Select)) {
+        view.tool = TimelineTool::Select;
+    }
+    sameLineWrap(82.0f);
+    if (ui::Button("Razor (C)", ImVec2(0, 28), view.tool == TimelineTool::Razor)) {
+        view.tool = TimelineTool::Razor;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click directly on any clip to slice it (C)");
+    sameLineWrap(76.0f);
+    if (ui::Button("Hand (H)", ImVec2(0, 28), view.tool == TimelineTool::Hand)) {
+        view.tool = TimelineTool::Hand;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Toggle Select / Hand Pan tool (H / V).\n"
-            "Tip: You can also pan anytime by dragging empty track space,\n"
-            "Middle-Mouse dragging, Right-Mouse dragging, or scrolling the Mouse Wheel.");
+            "Pan timeline (H).\n"
+            "Tip: You can always pan with Middle/Right-drag or empty track space drag.");
     }
 
-    ImGui::SameLine();
+    sameLineWrap(74.0f);
     if (ui::Button("Split (S)")) {
         const Time t = playback.playhead();
         const int pref = editor.selectedClip;
         editor.edit([&](Project& p) { return !ops::splitAt(p, t, pref).empty(); });
     }
-    ImGui::SameLine();
+    sameLineWrap(56.0f);
     ImGui::BeginDisabled(editor.selectedClip == 0);
+    if (ui::Button("Dup")) {
+        const int id = editor.selectedClip;
+        int dupId = 0;
+        editor.edit([&](Project& p) {
+            dupId = ops::duplicateClip(p, id);
+            return dupId != 0;
+        });
+        if (dupId != 0) editor.selectedClip = dupId;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate selected clip (Ctrl+D)");
+    sameLineWrap(62.0f);
     if (ui::Button("Delete")) {
         const int id = editor.selectedClip;
         editor.edit([&](Project& p) { return ops::deleteClip(p, id); });
         editor.selectedClip = 0;
     }
+    sameLineWrap(66.0f);
+    if (ui::Button("Ripple")) {
+        const int id = editor.selectedClip;
+        editor.edit([&](Project& p) { return ops::rippleDeleteClip(p, id); });
+        editor.selectedClip = 0;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ripple Delete (Shift+Del)");
     ImGui::EndDisabled();
 
-    // Show "Extract Audio" quick button when a video clip with audio is selected
     const Track* selTrack = nullptr;
     const Clip* selClip = ops::findClip(proj, editor.selectedClip, &selTrack);
-    const MediaAsset* selAsset = selClip ? proj.findAsset(selClip->assetId) : nullptr;
+    const MediaAsset* selAsset = (selClip && !selClip->isText) ? proj.findAsset(selClip->assetId) : nullptr;
     const bool canExtract =
         selClip && selTrack && selTrack->kind == TrackKind::Video && selAsset && selAsset->hasAudio;
-    ImGui::SameLine();
+    sameLineWrap(105.0f);
     ImGui::BeginDisabled(!canExtract);
     if (ui::Button("Extract Audio", ImVec2(0, 28), canExtract)) {
         const int cid = editor.selectedClip;
@@ -520,41 +1126,47 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
     }
     ImGui::EndDisabled();
 
-    ImGui::SameLine();
+    sameLineWrap(64.0f);
+    if (ui::Button("+ Text", ImVec2(0, 28))) {
+        const Time t = playback.playhead();
+        int newText = 0;
+        editor.edit([&](Project& p) {
+            newText = ops::addTextClip(p, 0, t);
+            return newText != 0;
+        });
+        if (newText != 0) editor.selectedClip = newText;
+    }
+
+    sameLineWrap(56.0f);
     ImGui::BeginDisabled(!editor.canUndo());
     if (ui::Button("Undo")) editor.undo();
     ImGui::EndDisabled();
-    ImGui::SameLine();
+    sameLineWrap(56.0f);
     ImGui::BeginDisabled(!editor.canRedo());
     if (ui::Button("Redo")) editor.redo();
     ImGui::EndDisabled();
 
-    ImGui::SameLine();
+    sameLineWrap(80.0f);
     if (ui::Button("+V Track")) {
         editor.edit([](Project& p) { return ops::addTrack(p, TrackKind::Video) != 0; });
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add Video Track");
-    ImGui::SameLine();
+    sameLineWrap(80.0f);
     if (ui::Button("+A Track")) {
         editor.edit([](Project& p) { return ops::addTrack(p, TrackKind::Audio) != 0; });
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add Audio Track");
 
-    ImGui::SameLine();
+    sameLineWrap(82.0f);
     ui::ToggleSwitch("Snap", &view.snapEnabled);
 
-    // Pan & Zoom controls
-    ImGui::SameLine();
+    sameLineWrap(36.0f);
     if (ui::Button("<<", ImVec2(32, 28))) view.scrollX = std::max(0.0f, view.scrollX - 240.0f);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pan timeline left");
-    ImGui::SameLine();
+    sameLineWrap(36.0f);
     if (ui::Button(">>", ImVec2(32, 28))) view.scrollX += 240.0f;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pan timeline right");
-    ImGui::SameLine();
+    sameLineWrap(44.0f);
     bool fitRequested = ui::Button("Fit", ImVec2(40, 28));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fit entire timeline in view");
 
-    ImGui::SameLine();
+    sameLineWrap(180.0f);
     if (ui::Button("-", ImVec2(26, 28))) {
         view.pixelsPerSecond = std::clamp(view.pixelsPerSecond * 0.8f, 10.0f, 400.0f);
     }
@@ -567,7 +1179,7 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
 
     ImGui::Separator();
 
-    constexpr float kHeaderW = 160.0f;
+    constexpr float kHeaderW = 186.0f;
     constexpr float kRulerH = 26.0f;
     constexpr float kTrackH = 58.0f;
     constexpr float kTrackGap = 4.0f;
@@ -614,7 +1226,6 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
     const ImVec2 hdrOrigin = ImGui::GetCursorScreenPos();
     ImDrawList* hdl = ImGui::GetWindowDrawList();
 
-    // Header corner above tracks
     hdl->AddRectFilled(hdrOrigin, ImVec2(hdrOrigin.x + kHeaderW - 4.0f, hdrOrigin.y + kRulerH),
                        IM_COL32(22, 24, 30, 255));
     hdl->AddText(ImVec2(hdrOrigin.x + 8.0f, hdrOrigin.y + 5.0f), IM_COL32(150, 158, 175, 255),
@@ -624,6 +1235,8 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
                       ImVec2(hdrOrigin.x + kHeaderW, hdrOrigin.y + kRulerH + tracksAreaH), true);
 
     int removeTrackId = 0;
+    int moveTrackId = 0;
+    int moveTrackDelta = 0;
     for (std::size_t i = 0; i < proj.tracks.size(); ++i) {
         const Track& tr = proj.tracks[i];
         ImGui::PushID(tr.id);
@@ -638,9 +1251,9 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
         hdl->AddText(ImVec2(hdrOrigin.x + 8.0f, y0 + 6.0f), IM_COL32(235, 240, 248, 255),
                      tr.name.c_str());
 
-        ImGui::SetCursorScreenPos(ImVec2(hdrOrigin.x + 8.0f, y0 + 27.0f));
+        ImGui::SetCursorScreenPos(ImVec2(hdrOrigin.x + 6.0f, y0 + 27.0f));
         const int tid = tr.id;
-        if (ui::Button(tr.muted ? "Mute*" : "Mute", ImVec2(48, 22), tr.muted)) {
+        if (ui::Button(tr.muted ? "M*" : "Mute", ImVec2(42, 22), tr.muted)) {
             editor.edit([tid](Project& p) {
                 if (Track* t = p.findTrack(tid)) {
                     t->muted = !t->muted;
@@ -652,8 +1265,8 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr.muted ? "Unmute track" : "Mute track");
 
         if (tr.kind == TrackKind::Video) {
-            ImGui::SameLine(0.0f, 4.0f);
-            if (ui::Button(tr.hidden ? "Hide*" : "Hide", ImVec2(48, 22), tr.hidden)) {
+            ImGui::SameLine(0.0f, 3.0f);
+            if (ui::Button(tr.hidden ? "H*" : "Hide", ImVec2(42, 22), tr.hidden)) {
                 editor.edit([tid](Project& p) {
                     if (Track* t = p.findTrack(tid)) {
                         t->hidden = !t->hidden;
@@ -664,7 +1277,21 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr.hidden ? "Show track" : "Hide track");
         }
-        ImGui::SameLine(0.0f, 4.0f);
+
+        ImGui::SameLine(0.0f, 3.0f);
+        if (ui::Button("^", ImVec2(22, 22))) {
+            moveTrackId = tid;
+            moveTrackDelta = -1;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move track up");
+        ImGui::SameLine(0.0f, 2.0f);
+        if (ui::Button("v", ImVec2(22, 22))) {
+            moveTrackId = tid;
+            moveTrackDelta = +1;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Move track down");
+
+        ImGui::SameLine(0.0f, 3.0f);
         if (ui::CircleActionButton("##deltrack", true, 22.0f)) removeTrackId = tid;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete track");
 
@@ -673,6 +1300,12 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
     hdl->PopClipRect();
     ImGui::EndChild();
 
+    if (moveTrackId != 0) {
+        editor.edit(
+            [moveTrackId, moveTrackDelta](Project& p) {
+                return ops::moveTrack(p, moveTrackId, moveTrackDelta);
+            });
+    }
     if (removeTrackId != 0) {
         editor.edit([removeTrackId](Project& p) { return ops::removeTrack(p, removeTrackId); });
     }
@@ -695,7 +1328,6 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
     const ImVec2 mouse = io.MousePos;
     const bool vpHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
 
-    // Coordinate conversions between screen X and timeline Time
     const auto xToTime = [&](float screenX) -> Time {
         return std::max<Time>(0, fromSeconds((screenX - vpOrigin.x + view.scrollX) / pps));
     };
@@ -703,15 +1335,15 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
         return vpOrigin.x + static_cast<float>(toSeconds(t) * pps) - view.scrollX;
     };
 
-    // Mouse wheel: Ctrl+Wheel = zoom anchored at cursor; Shift+Wheel = vertical pan; Wheel = horizontal pan
     if (vpHovered && (io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f)) {
         if (io.KeyCtrl && io.MouseWheel != 0.0f) {
             const Time anchorTime = xToTime(mouse.x);
             const float factor = io.MouseWheel > 0.0f ? 1.18f : (1.0f / 1.18f);
             view.pixelsPerSecond = std::clamp(view.pixelsPerSecond * factor, 10.0f, 400.0f);
             const float newX = static_cast<float>(toSeconds(anchorTime) * view.pixelsPerSecond);
-            view.scrollX = std::clamp(newX - (mouse.x - vpOrigin.x), 0.0f,
-                                      std::max(0.0f, static_cast<float>(totalSec * view.pixelsPerSecond) - viewW));
+            view.scrollX = std::clamp(
+                newX - (mouse.x - vpOrigin.x), 0.0f,
+                std::max(0.0f, static_cast<float>(totalSec * view.pixelsPerSecond) - viewW));
         } else if (io.KeyShift) {
             view.scrollY = std::clamp(view.scrollY - io.MouseWheel * 36.0f, 0.0f, maxScrollY);
         } else {
@@ -748,6 +1380,8 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
     // 2. Draw Track Lanes & Clips
     int hoveredClipId = 0;
     int hoveredTrackId = 0;
+    float hoveredClipY0 = 0.0f;
+    float hoveredClipY1 = 0.0f;
     TimelineViewState::DragKind hoverEdge = TimelineViewState::DragKind::MoveClip;
 
     dl->PushClipRect(tracksMin, tracksMax, true);
@@ -764,12 +1398,11 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
                         IM_COL32(36, 40, 50, 255));
         }
 
-        if (mouse.x >= tracksMin.x && mouse.x <= tracksMax.x && mouse.y >= std::max(y0, tracksMin.y) &&
-            mouse.y < std::min(y1, tracksMax.y)) {
+        if (mouse.x >= tracksMin.x && mouse.x <= tracksMax.x &&
+            mouse.y >= std::max(y0, tracksMin.y) && mouse.y < std::min(y1, tracksMax.y)) {
             hoveredTrackId = tr.id;
         }
 
-        // Custom drag-drop target per lane (does NOT create an InvisibleButton or steal mouse clicks)
         const ImRect laneRect(ImVec2(tracksMin.x, std::max(y0, tracksMin.y)),
                               ImVec2(tracksMax.x, std::min(y1, tracksMax.y)));
         if (laneRect.Min.y < laneRect.Max.y &&
@@ -794,18 +1427,20 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
             if (x1 < tracksMin.x || x0 > tracksMax.x) continue;
 
             const bool selected = (editor.selectedClip == c.id);
-            const ImU32 fillCol = tr.kind == TrackKind::Video
-                                      ? (selected ? IM_COL32(58, 134, 220, 255)
-                                                  : IM_COL32(42, 98, 168, 240))
-                                      : (selected ? IM_COL32(46, 162, 114, 255)
-                                                  : IM_COL32(32, 118, 84, 240));
+            ImU32 fillCol = 0;
+            if (c.isText) {
+                fillCol = selected ? IM_COL32(146, 98, 225, 255) : IM_COL32(106, 70, 175, 240);
+            } else if (tr.kind == TrackKind::Video) {
+                fillCol = selected ? IM_COL32(58, 134, 220, 255) : IM_COL32(42, 98, 168, 240);
+            } else {
+                fillCol = selected ? IM_COL32(46, 162, 114, 255) : IM_COL32(32, 118, 84, 240);
+            }
             const ImU32 borderCol =
                 selected ? IM_COL32(255, 214, 92, 255) : IM_COL32(90, 140, 200, 180);
 
             dl->AddRectFilled(ImVec2(x0, y0 + 2.0f), ImVec2(x1, y1 - 2.0f), fillCol, 5.0f);
 
-            // Audio waveform inside clip
-            const MediaAsset* asset = proj.findAsset(c.assetId);
+            const MediaAsset* asset = c.isText ? nullptr : proj.findAsset(c.assetId);
             if (asset && asset->hasAudio && !tr.muted && !c.muted) {
                 if (const AudioWaveform* wf = waveforms.get(*asset)) {
                     const float wy0 = tr.kind == TrackKind::Audio ? (y0 + 18.0f) : (y1 - 22.0f);
@@ -817,14 +1452,26 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
                 }
             }
 
+            // Transition in wedge
+            if (c.transitionIn != TransitionKind::None && c.transitionInDur > 0) {
+                const float tw = std::min(
+                    x1 - x0, static_cast<float>(toSeconds(c.transitionInDur) * pps));
+                if (tw > 2.0f) {
+                    dl->AddTriangleFilled(ImVec2(x0, y0 + 2.0f), ImVec2(x0 + tw, y0 + 2.0f),
+                                          ImVec2(x0, y1 - 2.0f), IM_COL32(0, 230, 245, 130));
+                }
+            }
+
             // Fade-in / Fade-out visual envelopes
-            if (c.fadeIn > 0) {
-                const float fx = std::min(x1, x0 + static_cast<float>(toSeconds(c.fadeIn) * pps));
+            const Time visFadeIn = std::max(c.fadeIn, c.videoFadeIn);
+            const Time visFadeOut = std::max(c.fadeOut, c.videoFadeOut);
+            if (visFadeIn > 0) {
+                const float fx = std::min(x1, x0 + static_cast<float>(toSeconds(visFadeIn) * pps));
                 dl->AddLine(ImVec2(x0, y1 - 3.0f), ImVec2(fx, y0 + 3.0f),
                             IM_COL32(255, 235, 120, 210), 1.8f);
             }
-            if (c.fadeOut > 0) {
-                const float fx = std::max(x0, x1 - static_cast<float>(toSeconds(c.fadeOut) * pps));
+            if (visFadeOut > 0) {
+                const float fx = std::max(x0, x1 - static_cast<float>(toSeconds(visFadeOut) * pps));
                 dl->AddLine(ImVec2(fx, y0 + 3.0f), ImVec2(x1, y1 - 3.0f),
                             IM_COL32(255, 235, 120, 210), 1.8f);
             }
@@ -832,32 +1479,40 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
             dl->AddRect(ImVec2(x0, y0 + 2.0f), ImVec2(x1, y1 - 2.0f), borderCol, 5.0f, 0,
                         selected ? 2.0f : 1.0f);
 
-            // Left & right trim handles
             dl->AddRectFilled(ImVec2(x0, y0 + 2.0f), ImVec2(x0 + 5.0f, y1 - 2.0f),
                               IM_COL32(255, 255, 255, 75), 4.0f);
             dl->AddRectFilled(ImVec2(x1 - 5.0f, y0 + 2.0f), ImVec2(x1, y1 - 2.0f),
                               IM_COL32(255, 255, 255, 75), 4.0f);
 
-            const char* title = asset ? asset->name.c_str() : "Clip";
+            std::string titleStr = c.isText ? ("T: " + c.text.content)
+                                            : (asset ? asset->name : std::string("Clip"));
+            for (char& ch : titleStr) {
+                if (ch == '\n' || ch == '\r') ch = ' ';
+            }
             char sub[96];
-            if (c.muted) {
-                std::snprintf(sub, sizeof sub, "%s [Muted]", formatTime(c.duration()).c_str());
-            } else if (std::fabs(c.volume - 1.0f) > 0.01f) {
-                std::snprintf(sub, sizeof sub, "%s (%.0f%%)", formatTime(c.duration()).c_str(),
-                              c.volume * 100.0f);
+            const std::string durStr = formatTime(c.duration());
+            if (c.muted && !c.isText && asset && asset->hasAudio) {
+                std::snprintf(sub, sizeof sub, "%s [Muted]", durStr.c_str());
+            } else if (std::fabs(c.speed - 1.0f) > 0.02f) {
+                std::snprintf(sub, sizeof sub, "%s (%.2fx)", durStr.c_str(), c.speed);
+            } else if (!c.isText && std::fabs(c.volume - 1.0f) > 0.01f) {
+                std::snprintf(sub, sizeof sub, "%s (%.0f%%)", durStr.c_str(), c.volume * 100.0f);
             } else {
-                std::snprintf(sub, sizeof sub, "%s", formatTime(c.duration()).c_str());
+                std::snprintf(sub, sizeof sub, "%s", durStr.c_str());
             }
 
             dl->PushClipRect(ImVec2(std::max(x0 + 6.0f, tracksMin.x), y0 + 3.0f),
                              ImVec2(std::min(x1 - 6.0f, tracksMax.x), y1 - 3.0f), true);
-            dl->AddText(ImVec2(x0 + 8.0f, y0 + 5.0f), IM_COL32(248, 250, 255, 255), title);
+            dl->AddText(ImVec2(x0 + 8.0f, y0 + 5.0f), IM_COL32(248, 250, 255, 255),
+                        titleStr.c_str());
             dl->AddText(ImVec2(x0 + 8.0f, y0 + 23.0f), IM_COL32(210, 226, 245, 215), sub);
             dl->PopClipRect();
 
             if (mouse.x >= x0 && mouse.x <= x1 && mouse.y >= std::max(y0 + 2.0f, tracksMin.y) &&
                 mouse.y <= std::min(y1 - 2.0f, tracksMax.y)) {
                 hoveredClipId = c.id;
+                hoveredClipY0 = y0 + 2.0f;
+                hoveredClipY1 = y1 - 2.0f;
                 constexpr float kEdgePx = 8.0f;
                 if (mouse.x - x0 <= kEdgePx)
                     hoverEdge = TimelineViewState::DragKind::TrimLeft;
@@ -867,6 +1522,13 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
                     hoverEdge = TimelineViewState::DragKind::MoveClip;
             }
         }
+    }
+
+    // Razor blade guide line when hovering a clip
+    if (view.tool == TimelineTool::Razor && vpHovered && hoveredClipId != 0 &&
+        mouse.y >= tracksMin.y && mouse.y <= tracksMax.y) {
+        dl->AddLine(ImVec2(mouse.x, hoveredClipY0), ImVec2(mouse.x, hoveredClipY1),
+                    IM_COL32(0, 235, 245, 235), 2.0f);
     }
     dl->PopClipRect();
 
@@ -886,8 +1548,11 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
 
     // 4. Cursor feedback
     if (vpHovered) {
-        if (view.dragKind == TimelineViewState::DragKind::Pan || view.panMode) {
+        if (view.dragKind == TimelineViewState::DragKind::Pan ||
+            view.tool == TimelineTool::Hand) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+        } else if (view.tool == TimelineTool::Razor && hoveredClipId != 0) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         } else if (hoveredClipId != 0 && view.dragKind == TimelineViewState::DragKind::None) {
             ImGui::SetMouseCursor(hoverEdge != TimelineViewState::DragKind::MoveClip
                                       ? ImGuiMouseCursor_ResizeEW
@@ -903,12 +1568,23 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
     if (ImGui::BeginPopup("ClipContextMenu")) {
         const Track* ctr = nullptr;
         const Clip* cc = ops::findClip(proj, editor.selectedClip, &ctr);
-        const MediaAsset* ca = cc ? proj.findAsset(cc->assetId) : nullptr;
+        const MediaAsset* ca = (cc && !cc->isText) ? proj.findAsset(cc->assetId) : nullptr;
         if (cc) {
             const int cid = cc->id;
-            if (ImGui::MenuItem("Split at Playhead (S)")) {
+            if (ImGui::MenuItem("Split at Playhead", "S")) {
                 editor.edit(
                     [&](Project& p) { return ops::splitClip(p, cid, playback.playhead()) != 0; });
+            }
+            if (ImGui::MenuItem("Duplicate Clip", "Ctrl+D")) {
+                int dupId = 0;
+                editor.edit([&](Project& p) {
+                    dupId = ops::duplicateClip(p, cid);
+                    return dupId != 0;
+                });
+                if (dupId != 0) editor.selectedClip = dupId;
+            }
+            if (ImGui::MenuItem("Copy Clip", "Ctrl+C")) {
+                view.clipboardClip = *cc;
             }
             if (ctr && ctr->kind == TrackKind::Video && ca && ca->hasAudio) {
                 if (ImGui::MenuItem("Extract Audio to Track")) {
@@ -933,8 +1609,12 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
                 }
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Delete Clip (Del)")) {
+            if (ImGui::MenuItem("Delete Clip", "Del")) {
                 editor.edit([&](Project& p) { return ops::deleteClip(p, cid); });
+                editor.selectedClip = 0;
+            }
+            if (ImGui::MenuItem("Ripple Delete", "Shift+Del")) {
+                editor.edit([&](Project& p) { return ops::rippleDeleteClip(p, cid); });
                 editor.selectedClip = 0;
             }
         }
@@ -948,7 +1628,6 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
          mouse.y <= vpOrigin.y + kRulerH + 10.0f);
     const bool inRuler = (mouse.y >= vpOrigin.y && mouse.y <= vpOrigin.y + kRulerH);
 
-    // Middle mouse or Right-drag on empty space starts panning immediately
     if (vpHovered && (ImGui::IsMouseClicked(ImGuiMouseButton_Middle) ||
                       (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && hoveredClipId == 0))) {
         view.dragKind = TimelineViewState::DragKind::Pan;
@@ -963,7 +1642,6 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
         if (inScrollbar) {
             view.dragKind = TimelineViewState::DragKind::Scrollbar;
             if (mouse.x < thumbX || mouse.x > thumbX + thumbW) {
-                // Jump thumb center to clicked position
                 const float ratio =
                     std::clamp((mouse.x - sbMin.x - thumbW * 0.5f) / std::max(1.0f, viewW - thumbW),
                                0.0f, 1.0f);
@@ -975,13 +1653,29 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
             view.dragKind = TimelineViewState::DragKind::Scrub;
             playback.pause();
             playback.seek(xToTime(mouse.x));
-        } else if (view.panMode || io.KeyAlt) {
+        } else if (view.tool == TimelineTool::Hand || io.KeyAlt) {
             view.dragKind = TimelineViewState::DragKind::Pan;
             view.dragStartMouseX = mouse.x;
             view.dragStartMouseY = mouse.y;
             view.dragStartScrollX = view.scrollX;
             view.dragStartScrollY = view.scrollY;
             view.panMoved = false;
+        } else if (view.tool == TimelineTool::Razor && hoveredClipId != 0) {
+            Time cutT = xToTime(mouse.x);
+            if (view.snapEnabled) {
+                bool snapped = false;
+                const Time snapThresh = fromSeconds(8.0 / pps);
+                const Time s = ops::snapTime(proj, cutT, snapThresh, playback.playhead(),
+                                             hoveredClipId, &snapped);
+                if (snapped) cutT = s;
+            }
+            const int cid = hoveredClipId;
+            int newRight = 0;
+            editor.edit([&](Project& p) {
+                newRight = ops::splitClip(p, cid, cutT);
+                return newRight != 0;
+            });
+            editor.selectedClip = newRight != 0 ? newRight : cid;
         } else if (hoveredClipId != 0) {
             editor.selectedClip = hoveredClipId;
             editor.selectedAsset = 0;
@@ -997,7 +1691,6 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
                 editor.beginGesture();
             }
         } else {
-            // Empty track space: dragging pans the timeline; a quick click without dragging seeks
             view.dragKind = TimelineViewState::DragKind::Pan;
             view.dragStartMouseX = mouse.x;
             view.dragStartMouseY = mouse.y;
@@ -1066,8 +1759,8 @@ void drawTimelinePanel(Editor& editor, PlaybackEngine& playback, TimelineViewSta
     }
 
     if (view.dragKind != TimelineViewState::DragKind::None && !anyDragButtonDown) {
-        if (view.dragKind == TimelineViewState::DragKind::Pan && !view.panMoved && !view.panMode) {
-            // Short click on empty track space: deselect clip and move playhead here
+        if (view.dragKind == TimelineViewState::DragKind::Pan && !view.panMoved &&
+            view.tool != TimelineTool::Hand) {
             editor.selectedClip = 0;
             playback.pause();
             playback.seek(xToTime(mouse.x));
@@ -1106,22 +1799,108 @@ void drawExportDialog(const Project& project, ExportDialogState& state, ExportJo
 
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(460, 260), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(490, 0), ImVec2(660, 580));
 
-    if (ImGui::BeginPopupModal("Export Video", nullptr, ImGuiWindowFlags_NoResize)) {
-        const char* resItems[] = {"1080p (1920x1080)", "720p (1280x720)", "480p (854x480)"};
-        const char* fpsItems[] = {"24 fps", "30 fps", "60 fps"};
+    if (ImGui::BeginPopupModal("Export Video", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        struct ResPreset {
+            const char* label;
+            int w;
+            int h;
+        };
+        static constexpr ResPreset kResPresets[] = {
+            {"4K UHD (3840x2160)", 3840, 2160},
+            {"1440p QHD (2560x1440)", 2560, 1440},
+            {"1080p FHD (1920x1080)", 1920, 1080},
+            {"720p HD (1280x720)", 1280, 720},
+            {"480p SD (854x480)", 854, 480},
+            {"4K Vertical (2160x3840)", 2160, 3840},
+            {"Match Project Canvas", 0, 0},
+            {"Custom Resolution...", -1, -1},
+        };
+        static constexpr int kPresetCount = static_cast<int>(std::size(kResPresets));
+        static constexpr int kCustomIdx = kPresetCount - 1;
+        static constexpr int kMatchProjectIdx = kPresetCount - 2;
+        static constexpr const char* kFpsItems[] = {"24 fps", "30 fps", "60 fps"};
+        static constexpr int kFpsValues[] = {24, 30, 60};
+        static constexpr const char* kQualityItems[] = {
+            "High Quality (CRF 18)",
+            "Balanced (CRF 21)",
+            "Compact File (CRF 25)",
+        };
+        static constexpr int kQualityCrfs[] = {18, 21, 25};
+        static constexpr const char* kEncoderItems[] = {
+            "Auto (GPU NVENC / AMF / QSV -> CPU)",
+            "CPU libx264 (Maximum Compatibility)",
+            "NVIDIA NVENC (h264_nvenc)",
+            "AMD AMF (h264_amf)",
+            "Intel Quick Sync (h264_qsv)",
+        };
+        static constexpr EncoderBackend kEncoderValues[] = {
+            EncoderBackend::Auto,
+            EncoderBackend::CpuX264,
+            EncoderBackend::Nvenc,
+            EncoderBackend::Amf,
+            EncoderBackend::Qsv,
+        };
+
+        state.resolutionPreset = std::clamp(state.resolutionPreset, 0, kPresetCount - 1);
+        state.fpsPreset = std::clamp(state.fpsPreset, 0, 2);
+        state.qualityPreset = std::clamp(state.qualityPreset, 0, 2);
+        state.encoderPreset = std::clamp(state.encoderPreset, 0, 4);
 
         ImGui::BeginDisabled(job.isRunning());
-        ImGui::Combo("Resolution", &state.resolutionPreset, resItems, 3);
-        ImGui::Combo("Frame Rate", &state.fpsPreset, fpsItems, 3);
+        if (ImGui::BeginCombo("Resolution", kResPresets[state.resolutionPreset].label)) {
+            for (int i = 0; i < kPresetCount; ++i) {
+                const bool selected = (i == state.resolutionPreset);
+                if (ImGui::Selectable(kResPresets[i].label, selected)) {
+                    state.resolutionPreset = i;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        if (state.resolutionPreset == kCustomIdx) {
+            ImGui::SetNextItemWidth(130.0f);
+            ImGui::InputInt("Width", &state.customWidth, 64, 256);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(130.0f);
+            ImGui::InputInt("Height", &state.customHeight, 64, 256);
+            state.customWidth = std::clamp(state.customWidth, 64, 7680);
+            state.customHeight = std::clamp(state.customHeight, 64, 7680);
+        }
+
+        ImGui::Combo("Frame Rate", &state.fpsPreset, kFpsItems, 3);
+        ImGui::Combo("Quality", &state.qualityPreset, kQualityItems, 3);
+        ImGui::Combo("Encoder", &state.encoderPreset, kEncoderItems, 5);
 
         ImGui::InputText("Output MP4", state.outputPath, sizeof state.outputPath);
         ImGui::SameLine();
-        if (ImGui::Button("Browse...")) {
+        if (ui::Button("Browse...", ImVec2(0, 26))) {
             if (cb.onBrowseExportPath) cb.onBrowseExportPath();
         }
         ImGui::EndDisabled();
+
+        int outW = kResPresets[state.resolutionPreset].w;
+        int outH = kResPresets[state.resolutionPreset].h;
+        if (state.resolutionPreset == kMatchProjectIdx) {
+            outW = project.settings.width;
+            outH = project.settings.height;
+        } else if (state.resolutionPreset == kCustomIdx) {
+            outW = state.customWidth;
+            outH = state.customHeight;
+        }
+        outW = (std::max(2, outW) + 1) & ~1;
+        outH = (std::max(2, outH) + 1) & ~1;
+        const int outFps = kFpsValues[state.fpsPreset];
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("MP4 (H.264 + AAC)  |  %dx%d @ %d fps  |  Duration: %s", outW, outH,
+                            outFps, formatTime(project.duration()).c_str());
+        if (static_cast<std::int64_t>(outW) * outH >= 3840LL * 2160LL &&
+            state.encoderPreset == 1) {
+            ImGui::TextDisabled("Tip: Switch Encoder to 'Auto' to use GPU acceleration if available.");
+        }
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -1129,12 +1908,14 @@ void drawExportDialog(const Project& project, ExportDialogState& state, ExportJo
 
         if (job.isRunning()) {
             ImGui::ProgressBar(job.progress(), ImVec2(-1, 22));
-            if (ImGui::Button("Cancel Export", ImVec2(130, 28))) job.cancel();
+            if (ui::Button("Cancel Export", ImVec2(130, 28))) job.cancel();
         } else {
             if (job.isDone()) {
                 if (job.succeeded()) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.50f, 1.0f), "Export finished: %s",
-                                       state.outputPath);
+                    const std::string enc = job.usedEncoder();
+                    ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.50f, 1.0f),
+                                       "Export finished (%s): %s",
+                                       enc.empty() ? "h264" : enc.c_str(), state.outputPath);
                 } else {
                     ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.40f, 1.0f), "Error: %s",
                                        job.error().c_str());
@@ -1144,18 +1925,12 @@ void drawExportDialog(const Project& project, ExportDialogState& state, ExportJo
             if (ui::PrimaryButton("Start Export", ImVec2(145, 32))) {
                 ExportOptions opts;
                 opts.outputPath = state.outputPath;
-                if (state.resolutionPreset == 0) {
-                    opts.width = 1920;
-                    opts.height = 1080;
-                } else if (state.resolutionPreset == 1) {
-                    opts.width = 1280;
-                    opts.height = 720;
-                } else {
-                    opts.width = 854;
-                    opts.height = 480;
-                }
-                opts.fps = (state.fpsPreset == 0) ? 24 : (state.fpsPreset == 1 ? 30 : 60);
+                opts.width = outW;
+                opts.height = outH;
+                opts.fps = outFps;
                 opts.sampleRate = project.settings.sampleRate;
+                opts.crf = kQualityCrfs[state.qualityPreset];
+                opts.encoder = kEncoderValues[state.encoderPreset];
                 job.start(project, std::move(opts));
             }
             ImGui::SameLine();

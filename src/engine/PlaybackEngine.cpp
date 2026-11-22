@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 #include "media/FFmpeg.hpp"
@@ -43,6 +44,7 @@ void PlaybackEngine::syncProject(const Project& project, std::uint64_t version) 
 }
 
 void PlaybackEngine::play() {
+    playbackSpeed_.store(1.0f);
     const Time dur = audioProject_.duration();
     if (dur > 0 && playhead_.load() >= dur) {
         seek(0);
@@ -55,6 +57,7 @@ void PlaybackEngine::play() {
 
 void PlaybackEngine::pause() {
     playing_.store(false);
+    playbackSpeed_.store(1.0f);
     peakL_.store(0.0f);
     peakR_.store(0.0f);
 }
@@ -64,6 +67,36 @@ void PlaybackEngine::togglePlay() {
         pause();
     else
         play();
+}
+
+void PlaybackEngine::shuttleBackward() {
+    const float cur = playbackSpeed_.load();
+    float next = -1.0f;
+    if (playing_.load() && cur < 0.0f) {
+        if (cur > -1.5f)
+            next = -2.0f;
+        else
+            next = -4.0f;
+    }
+    playbackSpeed_.store(next);
+    playing_.store(true);
+}
+
+void PlaybackEngine::shuttleForward() {
+    const float cur = playbackSpeed_.load();
+    float next = 1.0f;
+    if (playing_.load() && cur > 0.0f) {
+        if (cur < 1.5f)
+            next = 2.0f;
+        else
+            next = 4.0f;
+    }
+    if (next == 1.0f) {
+        play();
+    } else {
+        playbackSpeed_.store(next);
+        playing_.store(true);
+    }
 }
 
 void PlaybackEngine::stop() {
@@ -94,7 +127,8 @@ void PlaybackEngine::fillAudio(SDL_AudioStream* stream, int bytesNeeded) {
     const int frames = std::max(1, bytesNeeded / static_cast<int>(sizeof(float) * 2));
     mixBuf_.assign(static_cast<std::size_t>(frames) * 2, 0.0f);
 
-    if (playing_.load()) {
+    const float speed = playbackSpeed_.load();
+    if (playing_.load() && std::fabs(speed - 1.0f) < 0.01f) {
         std::lock_guard<std::mutex> lock(audioMutex_);
         const Time cur = audioCursor_.load();
         const Time dur = audioProject_.duration();
@@ -130,14 +164,15 @@ bool PlaybackEngine::updateFrame(const Project& project, std::uint64_t version, 
 
     if (playing_.load()) {
         const Time dur = project.duration();
+        const float speed = playbackSpeed_.load();
         if (dur <= 0) {
             pause();
         } else {
             const double clampedDt = std::clamp(dtSeconds, 0.0, 0.1);
-            Time next = playhead_.load() + fromSeconds(clampedDt);
+            Time next = playhead_.load() + fromSeconds(clampedDt * speed);
 
-            // Keep visual playhead gently synchronized with the audio stream clock
-            if (audioStream_) {
+            // Synchronize with audio clock only during normal 1.0x forward playback
+            if (audioStream_ && std::fabs(speed - 1.0f) < 0.01f) {
                 const int queuedBytes = SDL_GetAudioStreamAvailable(audioStream_);
                 const int queuedFrames =
                     std::max(0, queuedBytes / static_cast<int>(sizeof(float) * 2));
@@ -148,7 +183,10 @@ bool PlaybackEngine::updateFrame(const Project& project, std::uint64_t version, 
                 }
             }
 
-            if (next >= dur) {
+            if (speed < 0.0f && next <= 0) {
+                playhead_.store(0);
+                pause();
+            } else if (speed > 0.0f && next >= dur) {
                 if (loop_) {
                     seek(0);
                 } else {
@@ -156,7 +194,7 @@ bool PlaybackEngine::updateFrame(const Project& project, std::uint64_t version, 
                     pause();
                 }
             } else {
-                playhead_.store(next);
+                playhead_.store(std::max<Time>(0, next));
             }
         }
     }

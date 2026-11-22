@@ -15,6 +15,7 @@
 #include "core/PathUtil.hpp"
 #include "core/TimelineOps.hpp"
 #include "io/ProjectSerializer.hpp"
+#include "media/FrameBlit.hpp"
 #include "media/MediaProbe.hpp"
 #include "ui/Widgets.hpp"
 
@@ -117,6 +118,21 @@ bool App::importFile(const std::string& path) {
     return true;
 }
 
+bool App::importSubtitlesFile(const std::string& path) {
+    std::string err;
+    int count = 0;
+    editor_.edit([&](Project& p) {
+        count = ops::importSrtSubtitles(p, path, &err);
+        return count > 0;
+    });
+    if (count <= 0) {
+        statusMessage_ = err.empty() ? "Subtitle import failed" : ("Subtitles failed: " + err);
+        return false;
+    }
+    statusMessage_ = "Imported " + std::to_string(count) + " subtitles";
+    return true;
+}
+
 bool App::openProjectFile(const std::string& path) {
     std::string err;
     auto proj = loadProject(path, &err);
@@ -159,6 +175,23 @@ void App::showImportDialog() {
             }
         },
         this, window_, filters, 2, nullptr, true);
+}
+
+void App::showImportSubtitlesDialog() {
+    static const SDL_DialogFileFilter filters[] = {
+        {"SubRip Subtitles (*.srt)", "srt"},
+        {"All files", "*"},
+    };
+    SDL_ShowOpenFileDialog(
+        [](void* userdata, const char* const* filelist, int /*filter*/) {
+            if (!filelist) return;
+            auto* self = static_cast<App*>(userdata);
+            std::lock_guard<std::mutex> lock(self->dialogMutex_);
+            for (const char* const* p = filelist; *p; ++p) {
+                self->pendingSubtitles_.emplace_back(*p);
+            }
+        },
+        this, window_, filters, 2, nullptr, false);
 }
 
 void App::showOpenProjectDialog() {
@@ -210,17 +243,25 @@ void App::showBrowseExportDialog() {
 
 void App::processPendingDialogResults() {
     std::vector<std::string> imports;
+    std::vector<std::string> subtitles;
     std::string openPath;
     std::string savePath;
     std::string exportPath;
     {
         std::lock_guard<std::mutex> lock(dialogMutex_);
         imports.swap(pendingImports_);
+        subtitles.swap(pendingSubtitles_);
         openPath.swap(pendingOpenProject_);
         savePath.swap(pendingSaveProject_);
         exportPath.swap(pendingExportPath_);
     }
-    for (const auto& f : imports) importFile(f);
+    for (const auto& f : imports) {
+        if (pathFromUtf8(f).extension() == ".srt")
+            importSubtitlesFile(f);
+        else
+            importFile(f);
+    }
+    for (const auto& s : subtitles) importSubtitlesFile(s);
     if (!openPath.empty()) openProjectFile(openPath);
     if (!savePath.empty()) saveProjectFile(savePath);
     if (!exportPath.empty()) {
@@ -250,6 +291,7 @@ void App::drawMainMenuBar() {
         if (ImGui::MenuItem("Save Project As...")) showSaveProjectDialog();
         ImGui::Separator();
         if (ImGui::MenuItem("Import Media...", "Ctrl+I")) showImportDialog();
+        if (ImGui::MenuItem("Import Subtitles (.srt)...")) showImportSubtitlesDialog();
         if (ImGui::MenuItem("Export MP4...", "Ctrl+E")) {
             playback_.pause();
             exportDialog_.open = true;
@@ -263,6 +305,31 @@ void App::drawMainMenuBar() {
         if (ImGui::MenuItem("Undo", "Ctrl+Z", false, editor_.canUndo())) editor_.undo();
         if (ImGui::MenuItem("Redo", "Ctrl+Y", false, editor_.canRedo())) editor_.redo();
         ImGui::Separator();
+        if (ImGui::MenuItem("Copy Clip", "Ctrl+C", false, editor_.selectedClip != 0)) {
+            if (const Clip* c = ops::findClip(editor_.project(), editor_.selectedClip)) {
+                timelineView_.clipboardClip = *c;
+            }
+        }
+        if (ImGui::MenuItem("Paste Clip", "Ctrl+V", false,
+                            timelineView_.clipboardClip.has_value())) {
+            int pasted = 0;
+            const Clip src = *timelineView_.clipboardClip;
+            const Time at = playback_.playhead();
+            editor_.edit([&](Project& p) {
+                pasted = ops::pasteClip(p, src, 0, at);
+                return pasted != 0;
+            });
+            if (pasted != 0) editor_.selectedClip = pasted;
+        }
+        if (ImGui::MenuItem("Duplicate Clip", "Ctrl+D", false, editor_.selectedClip != 0)) {
+            const int id = editor_.selectedClip;
+            int dup = 0;
+            editor_.edit([&](Project& p) {
+                dup = ops::duplicateClip(p, id);
+                return dup != 0;
+            });
+            if (dup != 0) editor_.selectedClip = dup;
+        }
         if (ImGui::MenuItem("Split at Playhead", "S")) {
             const Time t = playback_.playhead();
             const int pref = editor_.selectedClip;
@@ -273,12 +340,21 @@ void App::drawMainMenuBar() {
             editor_.edit([&](Project& p) { return ops::deleteClip(p, id); });
             editor_.selectedClip = 0;
         }
+        if (ImGui::MenuItem("Ripple Delete Clip", "Shift+Del", false, editor_.selectedClip != 0)) {
+            const int id = editor_.selectedClip;
+            editor_.edit([&](Project& p) { return ops::rippleDeleteClip(p, id); });
+            editor_.selectedClip = 0;
+        }
         ImGui::EndMenu();
     }
 
     if (ImGui::BeginMenu("Playback")) {
         if (ImGui::MenuItem(playback_.isPlaying() ? "Pause" : "Play", "Space"))
             playback_.togglePlay();
+        if (ImGui::MenuItem("Shuttle Reverse (-1x/-2x/-4x)", "J")) playback_.shuttleBackward();
+        if (ImGui::MenuItem("Pause / Stop Shuttle", "K")) playback_.pause();
+        if (ImGui::MenuItem("Shuttle Forward (1x/2x/4x)", "L")) playback_.shuttleForward();
+        ImGui::Separator();
         if (ImGui::MenuItem("Step Back 1 Frame", "Left"))
             playback_.stepFrames(editor_.project(), -1);
         if (ImGui::MenuItem("Step Forward 1 Frame", "Right"))
@@ -305,6 +381,7 @@ void App::handleShortcuts() {
     if (io.WantTextInput) return;
 
     const bool ctrl = io.KeyCtrl;
+    const bool shift = io.KeyShift;
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z)) editor_.undo();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y)) editor_.redo();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O)) showOpenProjectDialog();
@@ -319,8 +396,36 @@ void App::handleShortcuts() {
         playback_.pause();
         exportDialog_.open = true;
     }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_C) && editor_.selectedClip != 0) {
+        if (const Clip* c = ops::findClip(editor_.project(), editor_.selectedClip)) {
+            timelineView_.clipboardClip = *c;
+            statusMessage_ = "Copied clip";
+        }
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V) && timelineView_.clipboardClip.has_value()) {
+        int pasted = 0;
+        const Clip src = *timelineView_.clipboardClip;
+        const Time at = playback_.playhead();
+        editor_.edit([&](Project& p) {
+            pasted = ops::pasteClip(p, src, 0, at);
+            return pasted != 0;
+        });
+        if (pasted != 0) editor_.selectedClip = pasted;
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_D) && editor_.selectedClip != 0) {
+        const int id = editor_.selectedClip;
+        int dup = 0;
+        editor_.edit([&](Project& p) {
+            dup = ops::duplicateClip(p, id);
+            return dup != 0;
+        });
+        if (dup != 0) editor_.selectedClip = dup;
+    }
 
     if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_Space)) playback_.togglePlay();
+    if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_J)) playback_.shuttleBackward();
+    if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_K)) playback_.pause();
+    if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_L)) playback_.shuttleForward();
     if ((!ctrl && ImGui::IsKeyPressed(ImGuiKey_S)) || (ctrl && ImGui::IsKeyPressed(ImGuiKey_B))) {
         const Time t = playback_.playhead();
         const int pref = editor_.selectedClip;
@@ -330,7 +435,9 @@ void App::handleShortcuts() {
         (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) &&
         editor_.selectedClip != 0) {
         const int id = editor_.selectedClip;
-        editor_.edit([&](Project& p) { return ops::deleteClip(p, id); });
+        editor_.edit([&](Project& p) {
+            return shift ? ops::rippleDeleteClip(p, id) : ops::deleteClip(p, id);
+        });
         editor_.selectedClip = 0;
     }
     if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_LeftArrow))
@@ -342,10 +449,15 @@ void App::handleShortcuts() {
         timelineView_.scrollX = 0.0f;
     }
     if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_H)) {
-        timelineView_.panMode = !timelineView_.panMode;
+        timelineView_.tool =
+            timelineView_.tool == TimelineTool::Hand ? TimelineTool::Select : TimelineTool::Hand;
+    }
+    if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+        timelineView_.tool =
+            timelineView_.tool == TimelineTool::Razor ? TimelineTool::Select : TimelineTool::Razor;
     }
     if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
-        timelineView_.panMode = false;
+        timelineView_.tool = TimelineTool::Select;
     }
 }
 
@@ -425,6 +537,7 @@ int App::run(int maxFrames) {
 
     UiCallbacks callbacks;
     callbacks.onImportMedia = [this]() { showImportDialog(); };
+    callbacks.onImportSubtitles = [this]() { showImportSubtitlesDialog(); };
     callbacks.onOpenExportDialog = [this]() {
         playback_.pause();
         exportDialog_.open = true;
@@ -443,8 +556,11 @@ int App::run(int maxFrames) {
             }
             if (ev.type == SDL_EVENT_DROP_FILE && ev.drop.data) {
                 const std::string dropped = ev.drop.data;
-                if (pathFromUtf8(dropped).extension() == ".vcut")
+                const auto ext = pathFromUtf8(dropped).extension();
+                if (ext == ".vcut")
                     openProjectFile(dropped);
+                else if (ext == ".srt")
+                    importSubtitlesFile(dropped);
                 else
                     importFile(dropped);
             }
@@ -465,15 +581,19 @@ int App::run(int maxFrames) {
             buildDefaultDockLayout(dockspaceId);
         }
 
-        if (playback_.updateFrame(editor_.project(), editor_.version(), kPreviewRenderW,
-                                  kPreviewRenderH, io.DeltaTime)) {
+        const ProjectSettings& ps = editor_.project().settings;
+        const FitRect pr = fitRect(ps.width, ps.height, kPreviewRenderW, kPreviewRenderH);
+        const int previewW = std::max(64, (pr.w + 1) & ~1);
+        const int previewH = std::max(64, (pr.h + 1) & ~1);
+        if (playback_.updateFrame(editor_.project(), editor_.version(), previewW, previewH,
+                                  io.DeltaTime)) {
             previewTex_.upload(playback_.frameWidth(), playback_.frameHeight(),
                                playback_.frameRgba().data());
         }
 
-        drawMediaBinPanel(editor_, thumbs_, callbacks);
-        drawPreviewPanel(editor_, playback_, previewTex_);
-        drawInspectorPanel(editor_, playback_);
+        drawMediaBinPanel(editor_, playback_, thumbs_, callbacks);
+        drawPreviewPanel(editor_, playback_, timelineView_, previewTex_);
+        drawInspectorPanel(editor_, playback_, timelineView_);
         drawTimelinePanel(editor_, playback_, timelineView_, waveforms_);
         drawExportDialog(editor_.project(), exportDialog_, exportJob_, callbacks);
 

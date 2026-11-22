@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(VCut VERSION 0.1.0 LANGUAGES C CXX)
+project(VCut VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,7 @@ find_package(nlohmann_json REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavformat libavcodec libswscale libswresample libavutil)
+pkg_check_modules(FREETYPE REQUIRED IMPORTED_TARGET freetype2)
 
 # Dear ImGui (docking branch, vendored in external/imgui)
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/external/imgui)
@@ -55,7 +56,7 @@ file(GLOB_RECURSE VCUT_CORE_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_SOURCE_DIR}/src/io/*.cpp)
 add_library(vcut_core STATIC ${VCUT_CORE_SOURCES})
 target_include_directories(vcut_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(vcut_core PUBLIC PkgConfig::FFMPEG nlohmann_json::nlohmann_json SDL3::SDL3)
+target_link_libraries(vcut_core PUBLIC PkgConfig::FFMPEG PkgConfig::FREETYPE nlohmann_json::nlohmann_json SDL3::SDL3)
 vcut_warnings(vcut_core)
 
 # ---------------------------------------------------------------------------

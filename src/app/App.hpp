@@ -24,6 +24,7 @@ public:
     int run(int maxFrames = 0);
 
     bool importFile(const std::string& path);
+    bool importSubtitlesFile(const std::string& path);
     bool openProjectFile(const std::string& path);
     bool saveProjectFile(const std::string& path);
 
@@ -35,6 +36,7 @@ private:
     void processPendingDialogResults();
 
     void showImportDialog();
+    void showImportSubtitlesDialog();
     void showOpenProjectDialog();
     void showSaveProjectDialog();
     void showBrowseExportDialog();
@@ -55,6 +57,7 @@ private:
 
     std::mutex dialogMutex_;
     std::vector<std::string> pendingImports_;
+    std::vector<std::string> pendingSubtitles_;
     std::string pendingOpenProject_;
     std::string pendingSaveProject_;
     std::string pendingExportPath_;

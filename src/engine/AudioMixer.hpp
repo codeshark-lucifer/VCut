@@ -11,7 +11,7 @@
 namespace vcut {
 
 // Mixes all unmuted clips overlapping [t, t + frames/sampleRate) into
-// interleaved stereo float samples, applying clip volume and fade-in/out.
+// interleaved stereo float samples, applying speed, clip volume, and fade-in/out.
 class AudioMixer {
 public:
     void mix(const Project& project, Time t, int frames, int sampleRate, float* outStereo,
@@ -31,6 +31,7 @@ private:
 
     std::unordered_map<int, Entry> decoders_;
     std::vector<float> clipBuf_;
+    std::vector<float> speedBuf_;
 };
 
 }  // namespace vcut
